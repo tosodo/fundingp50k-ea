@@ -338,7 +338,7 @@ void CRiskManager::KillSwitch() {
 
   for(int i = total - 1; i >= 0; i--) {
     ulong ticket = PositionGetTicket(i);
-    if(PositionGetInteger(POSITION_MAGIC) == m_magic_number) {
+    if((ulong)PositionGetInteger(POSITION_MAGIC) == m_magic_number) {
       trade.PositionClose(ticket);
     }
   }
@@ -358,7 +358,7 @@ void CRiskManager::FridayFlatten() {
     Print("[RiskManager] Friday close-all: closing ", total, " positions before weekend.");
     for(int i = total - 1; i >= 0; i--) {
       ulong ticket = PositionGetTicket(i);
-      if(PositionGetInteger(POSITION_MAGIC) == m_magic_number) {
+      if((ulong)PositionGetInteger(POSITION_MAGIC) == m_magic_number) {
         trade.PositionClose(ticket);
       }
     }
@@ -385,9 +385,13 @@ bool CRiskManager::IsNewsBlackout(string symbol) {
 
     if(cal_event.importance != CALENDAR_IMPORTANCE_HIGH) continue;
 
+    // The currency lives on the country record, not the event record
+    MqlCalendarCountry country;
+    if(!CalendarCountryById(cal_event.country_id, country)) continue;
+
     // Match currency
-    if(cal_event.currency == base_curr || cal_event.currency == quote_curr) {
-      Print("[RiskManager] NEWS BLACKOUT: ", cal_event.name, " (", cal_event.currency,
+    if(country.currency == base_curr || country.currency == quote_curr) {
+      Print("[RiskManager] NEWS BLACKOUT: ", cal_event.name, " (", country.currency,
             ") at ", TimeToString(values[i].time), " - blocking entry");
       return true;
     }
