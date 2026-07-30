@@ -51,7 +51,19 @@ private:
   // Magic number for position filtering
   ulong      m_magic_number;
 
+  // News calendar cache.
+  // CalendarValueHistory() blocks for ~90s the first time a terminal downloads
+  // the calendar database, and ~2s on the first call of each session. That is
+  // far too slow to sit on the per-trade path, so events are fetched on a timer
+  // and the blackout test itself is pure arithmetic over the cached times.
+  datetime   m_news_times[];
+  string     m_news_names[];
+  string     m_news_curr[];
+  datetime   m_news_refreshed;
+  string     m_news_symbol;
+
   // Helper methods
+  void   RefreshNewsCache(string symbol);
   bool   IsNewsBlackout(string symbol);
   bool   IsInsideSessionWindow();
   bool   IsFridayFlatten();
@@ -85,6 +97,8 @@ CRiskManager::CRiskManager() {
   m_starting_equity = FP_INITIAL_BALANCE;
   m_log_file = INVALID_HANDLE;
   m_magic_number = 50001;
+  m_news_refreshed = 0;
+  m_news_symbol = "";
 }
 
 //--- Destructor
@@ -117,6 +131,10 @@ bool CRiskManager::Init(double initial_balance, ulong magic) {
   } else {
     Print("[RiskManager] WARNING: Could not open log file: ", m_log_filename);
   }
+
+  // Warm the calendar cache here, at attach time, so the one-off download cost
+  // is paid before trading starts rather than stalling a live entry decision.
+  RefreshNewsCache(_Symbol);
 
   return true;
 }
@@ -365,21 +383,29 @@ void CRiskManager::FridayFlatten() {
   }
 }
 
-//--- IsNewsBlackout: Check CalendarValueHistory for high-impact events
-bool CRiskManager::IsNewsBlackout(string symbol) {
-  // Extract currency from symbol (first 3 chars for base, 4-6 for quote)
-  string base_curr = StringSubstr(symbol, 0, 3);
+//--- RefreshNewsCache: Pull high-impact events for this symbol into memory.
+//    Slow call - only ever invoked from Init() or the 60s refresh timer.
+void CRiskManager::RefreshNewsCache(string symbol) {
+  ArrayFree(m_news_times);
+  ArrayFree(m_news_names);
+  ArrayFree(m_news_curr);
+
+  m_news_symbol    = symbol;
+  m_news_refreshed = TimeCurrent();
+
+  // Base currency is the first 3 chars, quote currency the next 3
+  string base_curr  = StringSubstr(symbol, 0, 3);
   string quote_curr = StringSubstr(symbol, 3, 3);
 
-  datetime block_start = TimeCurrent() - NEWS_BLOCK_MINUTES * 60;
-  datetime block_end = TimeCurrent() + NEWS_BLOCK_MINUTES * 60;
+  // Fetch a wide window (1h back, 4h forward) so a 60s refresh interval can
+  // never miss an event that is about to enter the blackout band.
+  datetime from = TimeCurrent() - 3600;
+  datetime to   = TimeCurrent() + 4 * 3600;
 
-  // Query calendar for events
   MqlCalendarValue values[];
-  int count = CalendarValueHistory(values, block_start, block_end);
+  int count = CalendarValueHistory(values, from, to);
 
   for(int i = 0; i < count; i++) {
-    // Check if event currency matches symbol
     MqlCalendarEvent cal_event;
     if(!CalendarEventById(values[i].event_id, cal_event)) continue;
 
@@ -389,10 +415,40 @@ bool CRiskManager::IsNewsBlackout(string symbol) {
     MqlCalendarCountry country;
     if(!CalendarCountryById(cal_event.country_id, country)) continue;
 
-    // Match currency
-    if(country.currency == base_curr || country.currency == quote_curr) {
-      Print("[RiskManager] NEWS BLACKOUT: ", cal_event.name, " (", country.currency,
-            ") at ", TimeToString(values[i].time), " - blocking entry");
+    if(country.currency != base_curr && country.currency != quote_curr) continue;
+
+    int n = ArraySize(m_news_times);
+    ArrayResize(m_news_times, n + 1);
+    ArrayResize(m_news_names, n + 1);
+    ArrayResize(m_news_curr,  n + 1);
+    m_news_times[n] = values[i].time;
+    m_news_names[n] = cal_event.name;
+    m_news_curr[n]  = country.currency;
+  }
+
+  Print("[RiskManager] News cache refreshed for ", symbol, ": ",
+        ArraySize(m_news_times), " high-impact event(s) in the next 4h.");
+}
+
+//--- IsNewsBlackout: +/-5 min around any cached high-impact event.
+//    Pure arithmetic - safe to call on every tick.
+bool CRiskManager::IsNewsBlackout(string symbol) {
+  // Refresh at most once a minute, or immediately if the symbol changed
+  if(symbol != m_news_symbol || m_news_refreshed == 0 ||
+     TimeCurrent() - m_news_refreshed >= 60) {
+    RefreshNewsCache(symbol);
+  }
+
+  datetime now = TimeCurrent();
+  long block_secs = NEWS_BLOCK_MINUTES * 60;
+
+  for(int i = 0; i < ArraySize(m_news_times); i++) {
+    long delta = (long)now - (long)m_news_times[i];
+    if(delta < 0) delta = -delta;
+
+    if(delta <= block_secs) {
+      Print("[RiskManager] NEWS BLACKOUT: ", m_news_names[i], " (", m_news_curr[i],
+            ") at ", TimeToString(m_news_times[i]), " - blocking entry");
       return true;
     }
   }

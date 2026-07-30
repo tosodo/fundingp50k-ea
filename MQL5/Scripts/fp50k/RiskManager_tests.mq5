@@ -11,25 +11,25 @@ int test_count  = 0;
 int test_passed = 0;
 int test_failed = 0;
 
-void Check(string name, bool passed)
+void Check(string name, bool passed, string detail = "")
   {
    test_count++;
    if(passed)
      {
       test_passed++;
-      Print("[PASS] ", test_count, ": ", name);
+      Print("[QA] PASS | ", name, " | ", detail);
      }
    else
      {
       test_failed++;
-      Print("[FAIL] ", test_count, ": ", name);
+      Print("[QA] FAIL | ", name, " | ", detail);
      }
   }
 
 //--- Informational only - does not affect pass/fail
 void Info(string label, string value)
   {
-   Print("[INFO] ", label, ": ", value);
+   Print("[QA] INFO | ", label, " | ", value);
   }
 
 void OnStart()
@@ -120,6 +120,21 @@ void OnStart()
    if(breach_ok == false)
       Info("Second gate reason", reason);
 
+// The gate runs on every candidate entry, so it must never block on a slow
+// calendar query. CalendarValueHistory() costs ~2s cold and ~90s on a terminal
+// downloading the calendar database for the first time - both unacceptable
+// here, which is why events are cached and refreshed on a timer instead.
+   uint t0 = GetTickCount();
+   for(int i = 0; i < 50; i++)
+     {
+      string r = "";
+      risk.CanOpenTrade(50.0, 400.0, _Symbol, r);
+     }
+   uint elapsed = GetTickCount() - t0;
+   Info("50 gate calls took", IntegerToString(elapsed) + " ms");
+   Check("Gate stays off the slow calendar path (50 calls under 500ms)",
+         elapsed < 500, IntegerToString(elapsed) + " ms");
+
 //--- GROUP 8: State machine enum integrity
    Check("RISK_OK == 0",        (int)RISK_OK        == 0);
    Check("RISK_SOFT_STOP == 1", (int)RISK_SOFT_STOP == 1);
@@ -142,11 +157,5 @@ void OnStart()
          gmt.hour >= SESSION_OPEN_HOUR && gmt.hour < SESSION_CLOSE_HOUR) ? "YES" : "NO");
 
 //--- Summary
-   Print("=== TEST SUMMARY ===");
-   Print("Total: ", test_count, " | Passed: ", test_passed, " | Failed: ", test_failed);
-
-   if(test_failed == 0)
-      Print(">>> ALL TESTS PASSED <<<");
-   else
-      Print(">>> ", test_failed, " TEST(S) FAILED <<<");
+   Print("[QA] ===== RESULT: ", test_passed, " passed, ", test_failed, " failed =====");
   }
