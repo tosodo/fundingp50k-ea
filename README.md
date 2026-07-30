@@ -21,6 +21,8 @@ All code in this repository is original work authored and owned by the account h
 | `MQL5/Experts/fp50k/FP50K_EA.mq5` | Main EA — execution layer | 3 |
 | `MQL5/Scripts/fp50k/RiskManager_tests.mq5` | Unit tests for Risk Governor | 1 |
 | `MQL5/Scripts/fp50k/SignalEngine_tests.mq5` | Unit tests for Signal Engine | 2 |
+| `sync_to_mt5.sh` | Copies source into the Wine MT5 install | 1 |
+| `run_tests.sh` | Headless compile + test runner | 2 |
 
 ## Risk Parameters (FundingPips $50k 2-Step Flex)
 
@@ -51,27 +53,34 @@ All code in this repository is original work authored and owned by the account h
 ## Setup
 
 ### Prerequisites
-- MetaTrader 5 installed on your system
-- MQL5 development environment ready
-- Git repository initialized
+- MetaTrader 5 for Mac (Wine-hosted) installed in `/Applications`
+- The `mql5-wine-qa` skill, for headless compiling
 
-### Environment Setup
+### Copy source into MetaTrader
 
-1. Find your MT5 MQL5 folder:
 ```bash
-find /Users -name "MQL5" -type d 2>/dev/null | grep MetaQuotes | head -5
-```
-
-2. Set the path in `sync_to_mt5.sh`:
-```bash
-# Edit sync_to_mt5.sh and replace REPLACE_WITH_ACTUAL_PATH
-```
-
-3. Run the sync:
-```bash
-chmod +x sync_to_mt5.sh
 ./sync_to_mt5.sh
 ```
+
+### Compile and run the test suites
+
+MetaTrader must **not** be open — it is single-instance, and a running
+copy silently swallows the headless launch.
+
+```bash
+./run_tests.sh
+```
+
+Runs every `*_tests.mq5`, compiling each first and failing the run on any
+compile error, any warning, or any failed assertion. Pass a name to run one
+suite: `./run_tests.sh SignalEngine_tests`.
+
+Current state: **95 assertions, 0 failures.**
+
+| Suite | Assertions |
+|-------|-----------|
+| `RiskManager_tests` | 36 |
+| `SignalEngine_tests` | 59 |
 
 ## Commit History
 
