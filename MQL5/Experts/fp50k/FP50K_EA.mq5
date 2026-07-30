@@ -32,7 +32,14 @@ input int      InpMaxSpreadGBP  = 25;      // Max spread GBPUSD (points)
 //--- Strategy
 input bool     InpTradeEURUSD   = true;    // Enable EURUSD
 input bool     InpTradeGBPUSD   = true;    // Enable GBPUSD
-//--- Trade management
+//--- Entry geometry. Both defaults reproduce the original behaviour exactly.
+input double   InpStopRangeFrac = 0.0;     // Stop distance as x range width (0=far side of range)
+input bool     InpConsistentTP  = false;   // Measure target from entry (true) or range (false)
+//--- Trade management. Each stage can be switched off independently, which is
+//    the only way to measure what the raw entry signal is worth on its own.
+input bool     InpUsePartial    = true;    // Take the partial close at 1R
+input bool     InpUseBreakeven  = true;    // Move stop to breakeven at 1R
+input bool     InpUseTrail      = true;    // Trail the stop after 1R
 input double   InpPartialPct    = 50.0;    // Partial close at 1R (% of position)
 input double   InpAtrTrailMult  = 0.5;     // ATR multiple for trailing stop
 input int      InpNewsCloseMin  = 3;       // Close open trades N min before news
@@ -212,6 +219,7 @@ int OnInit() {
 
   if(InpTradeEURUSD) {
     if(!g_signal_eur.Init(SYM_EUR, InpRiskUSD, InpRRRatio)) return INIT_FAILED;
+    g_signal_eur.SetGeometry(InpStopRangeFrac, InpConsistentTP);
     g_atr_eur = iATR(SYM_EUR, PERIOD_H1, 14);
     if(g_atr_eur == INVALID_HANDLE) {
       Print("[FP50K] FATAL: could not create EURUSD ATR handle.");
@@ -220,6 +228,7 @@ int OnInit() {
   }
   if(InpTradeGBPUSD) {
     if(!g_signal_gbp.Init(SYM_GBP, InpRiskUSD, InpRRRatio)) return INIT_FAILED;
+    g_signal_gbp.SetGeometry(InpStopRangeFrac, InpConsistentTP);
     g_atr_gbp = iATR(SYM_GBP, PERIOD_H1, 14);
     if(g_atr_gbp == INVALID_HANDLE) {
       Print("[FP50K] FATAL: could not create GBPUSD ATR handle.");
@@ -300,8 +309,12 @@ void ManagePosition(ulong ticket, int atr_handle) {
 
   bool partial_done = IsPartialDone(ticket);
 
-  // 2. Partial close at 1R, then stop to breakeven.
+  // 2. The 1R checkpoint: partial close, then stop to breakeven. Either half
+  //    can be switched off; with both off this stage only records that 1R was
+  //    reached, which is what releases the trailing stage below.
   if(!partial_done) {
+    if(!InpUsePartial && !InpUseBreakeven && !InpUseTrail) return;
+
     if(sl <= 0.0) return;   // no stop = no measurable R; leave it alone
 
     double r_dist = MathAbs(entry - sl);
@@ -310,37 +323,45 @@ void ManagePosition(ulong ticket, int atr_handle) {
     double moved = is_long ? (price - entry) : (entry - price);
     if(moved < r_dist) return;
 
-    double step  = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
-    double vmin  = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
-    double close_vol = NormalizeLots(symbol, vol * (InpPartialPct / 100.0));
+    if(InpUsePartial) {
+      double step  = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
+      double vmin  = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
+      double close_vol = NormalizeLots(symbol, vol * (InpPartialPct / 100.0));
 
-    // Only take the partial if BOTH halves remain legal sizes. On a minimum-lot
-    // position, halving would leave an unclosable remainder.
-    if(close_vol >= vmin && (vol - close_vol) >= vmin && step > 0.0) {
-      if(g_trade.PositionClosePartial(ticket, close_vol)) {
-        Print("[FP50K] 1R reached on ", symbol, " ticket ", ticket,
-              " - closed ", DoubleToString(close_vol, 2), " of ",
-              DoubleToString(vol, 2), " lots.");
+      // Only take the partial if BOTH halves remain legal sizes. On a
+      // minimum-lot position, halving leaves an unclosable remainder.
+      if(close_vol >= vmin && (vol - close_vol) >= vmin && step > 0.0) {
+        if(g_trade.PositionClosePartial(ticket, close_vol)) {
+          Print("[FP50K] 1R reached on ", symbol, " ticket ", ticket,
+                " - closed ", DoubleToString(close_vol, 2), " of ",
+                DoubleToString(vol, 2), " lots.");
+        } else {
+          Print("[FP50K] WARNING: partial close failed, retcode=", g_trade.ResultRetcode());
+          return;
+        }
       } else {
-        Print("[FP50K] WARNING: partial close failed, retcode=", g_trade.ResultRetcode());
-        return;
+        Print("[FP50K] 1R reached on ", symbol, " but position too small to split.");
       }
-    } else {
-      Print("[FP50K] 1R reached on ", symbol, " but position too small to split - ",
-            "moving to breakeven only.");
     }
 
-    double be = NormalizePrice(symbol, entry);
-    if(g_trade.PositionModify(ticket, be, tp)) {
-      Print("[FP50K] Stop moved to breakeven on ", symbol, " ticket ", ticket);
-      MarkPartialDone(ticket);
-    } else {
-      Print("[FP50K] WARNING: breakeven move failed, retcode=", g_trade.ResultRetcode());
+    if(InpUseBreakeven) {
+      double be = NormalizePrice(symbol, entry);
+      if(g_trade.PositionModify(ticket, be, tp))
+        Print("[FP50K] Stop moved to breakeven on ", symbol, " ticket ", ticket);
+      else
+        Print("[FP50K] WARNING: breakeven move failed, retcode=", g_trade.ResultRetcode());
     }
+
+    // Marked whether or not the modify succeeded: 1R HAS been reached, and
+    // re-running this stage on every later tick would spam the broker.
+    MarkPartialDone(ticket);
+    Print("[FP50K] 1R checkpoint passed on ", symbol, " ticket ", ticket);
     return;
   }
 
-  // 3. ATR trailing stop, once the partial is banked.
+  // 3. ATR trailing stop, once the 1R checkpoint is behind us.
+  if(!InpUseTrail) return;
+
   double atr = AtrValue(atr_handle);
   if(atr <= 0.0) return;
 

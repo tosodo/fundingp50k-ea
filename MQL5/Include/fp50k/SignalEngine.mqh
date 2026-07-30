@@ -64,6 +64,11 @@ private:
   double      m_risk_usd;
   string      m_symbol;
 
+  // Entry geometry. Both default to the original behaviour so an engine that
+  // is never configured trades exactly as it did before these existed.
+  double      m_stop_range_frac;  // 0 = stop at the far side of the range
+  bool        m_consistent_tp;    // false = target measured from the range
+
   // Indicator handles are a finite resource - create once, reuse, release.
   int         m_ma_handle;
 
@@ -75,6 +80,11 @@ public:
   ~CSignalEngine();
 
   bool    Init(string symbol, double risk_usd = 500.0, double rr = 2.0);
+
+  // Optional geometry override, applied after Init(). Left alone, the engine
+  // keeps the original range-width stop and range-measured target.
+  void    SetGeometry(double stop_range_frac, bool consistent_tp);
+
   void    OnNewBar(string symbol);
   SSignal CheckSignal(string symbol);
   int     GetH4Trend(string symbol);
@@ -84,19 +94,25 @@ public:
   // market. CheckSignal() feeds it live values; tests feed it fixed ones, which
   // is the only way to exercise stop/target placement without waiting for a
   // real breakout to occur.
+  //
+  // The two trailing parameters default to the original geometry, so existing
+  // callers and tests that pass nine arguments are unaffected.
   SSignal BuildSignal(string symbol, bool is_long,
                       double range_high, double range_low, double range_pips,
-                      double ask, double bid, double pip, double rr);
+                      double ask, double bid, double pip, double rr,
+                      double stop_range_frac = 0.0, bool consistent_tp = false);
 
   CAsianRange *Range() { return GetPointer(m_asian_range); }
 };
 
 //--- Constructor
 CSignalEngine::CSignalEngine() {
-  m_rr_ratio  = 2.0;
-  m_risk_usd  = 500.0;
-  m_symbol    = "";
-  m_ma_handle = INVALID_HANDLE;
+  m_rr_ratio        = 2.0;
+  m_risk_usd        = 500.0;
+  m_symbol          = "";
+  m_ma_handle       = INVALID_HANDLE;
+  m_stop_range_frac = 0.0;
+  m_consistent_tp   = false;
 }
 
 //--- Destructor
@@ -128,6 +144,20 @@ bool CSignalEngine::Init(string symbol, double risk_usd, double rr) {
         " risk=$", DoubleToString(m_risk_usd, 2),
         " rr=", DoubleToString(m_rr_ratio, 1));
   return true;
+}
+
+//--- SetGeometry: change where the stop and target go.
+//    A negative fraction is meaningless and is clamped to 0 (legacy) rather
+//    than allowed to produce a stop on the wrong side of the entry.
+void CSignalEngine::SetGeometry(double stop_range_frac, bool consistent_tp) {
+  m_stop_range_frac = (stop_range_frac > 0.0) ? stop_range_frac : 0.0;
+  m_consistent_tp   = consistent_tp;
+
+  Print("[SignalEngine] Geometry ", m_symbol,
+        " stop=", (m_stop_range_frac > 0.0
+                     ? DoubleToString(m_stop_range_frac, 2) + "x range from entry"
+                     : "far side of range"),
+        " target=", (m_consistent_tp ? "rr x actual stop" : "range-measured"));
 }
 
 //--- PipSize
@@ -199,7 +229,8 @@ int CSignalEngine::GetH4Trend(string symbol) {
 //--- BuildSignal: pure entry geometry - no market access, fully testable
 SSignal CSignalEngine::BuildSignal(string symbol, bool is_long,
                                    double range_high, double range_low, double range_pips,
-                                   double ask, double bid, double pip, double rr) {
+                                   double ask, double bid, double pip, double rr,
+                                   double stop_range_frac, bool consistent_tp) {
   if(pip <= 0.0)
     return Invalid(symbol, "Cannot resolve pip size");
 
@@ -216,22 +247,42 @@ SSignal CSignalEngine::BuildSignal(string symbol, bool is_long,
   s.risk_usd    = m_risk_usd;
   s.signal_time = TimeCurrent();
 
-  if(is_long) {
-    s.entry_price = ask;
-    s.stop_loss   = range_low - (SL_BUFFER_PIPS * pip);
-    s.take_profit = range_high + (range_pips * rr * pip);
-    s.sl_pips     = (s.entry_price - s.stop_loss) / pip;
+  s.entry_price = is_long ? ask : bid;
+
+  // --- Stop ---------------------------------------------------------------
+  // Default (stop_range_frac = 0) puts the stop beyond the FAR side of the
+  // range, so every trade risks the whole range width. A positive fraction
+  // measures the stop from the entry instead, which is what makes the cost of
+  // a trade adjustable rather than dictated by how wide the Asian session was.
+  if(stop_range_frac > 0.0) {
+    double stop_dist = (range_pips * stop_range_frac + SL_BUFFER_PIPS) * pip;
+    s.stop_loss = is_long ? (s.entry_price - stop_dist)
+                          : (s.entry_price + stop_dist);
   } else {
-    s.entry_price = bid;
-    s.stop_loss   = range_high + (SL_BUFFER_PIPS * pip);
-    s.take_profit = range_low - (range_pips * rr * pip);
-    s.sl_pips     = (s.stop_loss - s.entry_price) / pip;
+    s.stop_loss = is_long ? (range_low  - SL_BUFFER_PIPS * pip)
+                          : (range_high + SL_BUFFER_PIPS * pip);
   }
+
+  s.sl_pips = (is_long ? (s.entry_price - s.stop_loss)
+                       : (s.stop_loss - s.entry_price)) / pip;
 
   // A non-positive stop distance means price crossed the level between the
   // breakout check and the quote read - reject rather than send a broken order.
   if(s.sl_pips <= 0.0)
     return Invalid(symbol, "Computed stop distance is not positive");
+
+  // --- Target -------------------------------------------------------------
+  // Legacy measures reward from the NEAR side of the range while risk is
+  // measured from the far side, so a nominal 2.0 does not deliver 2.0. The
+  // consistent form measures both from the entry, and actually pays rr.
+  if(consistent_tp) {
+    double reward = s.sl_pips * rr * pip;
+    s.take_profit = is_long ? (s.entry_price + reward)
+                            : (s.entry_price - reward);
+  } else {
+    s.take_profit = is_long ? (range_high + range_pips * rr * pip)
+                            : (range_low  - range_pips * rr * pip);
+  }
 
   s.reason = StringFormat("Asian breakout + retest confirmed | Range: %.1fpips | Dir: %s",
                           range_pips, (is_long ? "LONG" : "SHORT"));
@@ -282,7 +333,8 @@ SSignal CSignalEngine::CheckSignal(string symbol) {
                           m_asian_range.GetRangeHigh(),
                           m_asian_range.GetRangeLow(),
                           m_asian_range.GetRangePips(),
-                          ask, bid, PipSize(symbol), m_rr_ratio);
+                          ask, bid, PipSize(symbol), m_rr_ratio,
+                          m_stop_range_frac, m_consistent_tp);
   if(!s.valid) return s;
 
   // 8. Log

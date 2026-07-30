@@ -111,6 +111,17 @@ ReplaceReport=1
 ShutdownTerminal=1
 EOF
 
+# EA inputs. Anything not listed here keeps the default compiled into the EA.
+# BT_INPUTS is a semicolon-separated list, e.g.
+#   BT_INPUTS="InpAtrTrailMult=2.0;InpPartialPct=25" ./run_backtest.sh smoke
+if [ -n "${BT_INPUTS:-}" ]; then
+    echo "" >> "$INI_PATH"
+    echo "[TesterInputs]" >> "$INI_PATH"
+    echo "$BT_INPUTS" | tr ';' '\n' | while IFS= read -r kv; do
+        [ -n "$kv" ] && echo "$kv" >> "$INI_PATH"
+    done
+fi
+
 MODEL_NAME="1 minute OHLC"
 [ "$MODEL" = "4" ] && MODEL_NAME="every tick based on real ticks"
 [ "$MODEL" = "0" ] && MODEL_NAME="every tick (generated)"
@@ -123,6 +134,7 @@ echo "  Period   : $FROM -> $TO"
 echo "  Modelling: $MODEL_NAME"
 echo "  Deposit  : \$$DEPOSIT   Leverage 1:$LEVERAGE"
 echo "  Timeout  : ${WAIT_SECS}s"
+[ -n "${BT_INPUTS:-}" ] && echo "  Inputs   : $BT_INPUTS"
 echo "--------------------------------------------------------------"
 echo "  Simulation only. No orders are placed on the live account."
 echo "=============================================================="

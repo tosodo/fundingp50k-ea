@@ -1,12 +1,14 @@
 # Backtest Results — FP50K-EA
 
-**Status: FIRST RUN COMPLETE — ACCEPTANCE: FAIL.**
+**Status: ACCEPTANCE: FAIL — the entry signal has no measurable edge.**
 
-The strategy loses money as currently configured. One smoke run has been
-executed (2025, EURUSD H1, 1-minute bars) and is recorded below. It broke none
-of FundingPips' rules and still lost $5,544 over the year, so it does not
-justify buying a challenge. The standard below was written down *before* the
-run, not chosen afterwards to fit what came out.
+The strategy loses money, and 20 backtest variants have now established that the
+losses do not come from the exits. With all trade management switched off and
+the target measured honestly, the Asian-breakout-plus-retest entry wins less
+often than the break-even hit rate at every stop distance tested. It broke none
+of FundingPips' rules and still lost money, so it does not justify buying a
+challenge. The standard below was written down *before* the first run, not
+chosen afterwards to fit what came out.
 
 ---
 
@@ -176,12 +178,81 @@ loss.
 
 ---
 
+### 2026-07-30 — Isolation test: is the edge in the exits or the entry?
+
+All runs EURUSD H1, 2025, 1-minute bars, $50,000, risk $500/trade.
+
+**Round 1 — vary the exits, keep the entry fixed (12 variants).** Trailing-stop
+multiple swept 0.5→6.0, partial close 25%/50%, target 1:1→3:1. Every variant
+lost. Profit factor stayed inside **0.69–0.83** throughout, and the average loss
+sat at **$468–$481 (0.96R) in all twelve** — no exit setting can move it,
+because losers always travel the full stop distance. When the whole plausible
+range of an input barely moves the result, that input is not the cause.
+
+**Round 2 — remove the exits entirely and test the entry alone.** Partial close,
+breakeven and trailing all off, target measured from the entry so a nominal 2:1
+actually pays 2:1. Each trade is then a clean +2R or −1R bet, and **break-even
+requires a 33.3% hit rate.**
+
+| Stop distance | Trades | Win % | PF | Max DD |
+|---|---|---|---|---|
+| far side of range (legacy geometry) | 58 | 29.3% | 0.66 | 13.06% |
+| far side of range, honest 2:1 | 57 | 24.6% | 0.64 | 13.06% |
+| 1.00× range from entry | 57 | 24.6% | 0.64 | 13.19% |
+| 0.50× range from entry | 46 | 26.1% | 0.72 | 12.61% |
+| 0.35× range from entry | 60 | 28.3% | 0.81 | 13.48% |
+| 0.25× range from entry | 88 | 30.7% | 0.90 | 14.82% |
+| 0.15× range from entry | 55 | 29.1% | 0.84 | 19.10% |
+
+Profit factor improves monotonically as the stop tightens, peaks at **0.90** at
+0.25× range, then **turns back down** at 0.15×. The curve converges below 1.0
+rather than crossing it — and the improvement comes from cutting the size of
+losses, not from the entry being right more often.
+
+**Cross-check at a 1:1 target** (0.35× stop, break-even needs >50%):
+45.8% win rate, PF 0.85. Also short of break-even.
+
+**Conclusion: the entry signal is roughly a coin flip.** It misses the required
+hit rate at 2:1 (best 30.7% vs 33.3% needed) and at 1:1 (45.8% vs 50% needed),
+at every stop distance tried. No exit rule, position-sizing scheme or target
+multiple can rescue a signal that does not predict direction. Per the stopping
+rule agreed before the test, **tuning of this entry stops here.**
+
+Two genuine defects were found and fixed along the way, independent of the
+verdict above:
+
+1. Risk was measured from the far side of the Asian range plus a 2-pip buffer
+   while reward was measured from the near side, so a nominal 2.0 R:R delivered
+   roughly 1.79:1. `InpConsistentTP` measures both from the entry.
+2. Stop placement was hardcoded, so the single most important parameter in the
+   strategy could not be tested. `InpStopRangeFrac` exposes it.
+
+`InpUsePartial` / `InpUseBreakeven` / `InpUseTrail` were added so each trade-
+management stage can be disabled independently — previously `InpPartialPct=0`
+still triggered the breakeven move, which made the raw entry impossible to
+measure. All defaults reproduce the original behaviour; the 227 unit tests pass
+unchanged.
+
+**Data availability (corrected):** EURUSD bar history is present on
+FundingPips-SIM1 from 2012 and GBPUSD from 2014, so the 2022–2025 acceptance
+window *is* reachable on bars. Real tick data is stored only for July 2026, so a
+99%-tick-quality run still requires a large download first.
+
+---
+
 ## Decision
 
 **Is a challenge purchase justified by the backtest? — NO, not on current
 evidence.**
 
-The only run on record loses money. It stays "no" until a run appears above
-with ACCEPTANCE: PASS. This failing run is committed deliberately: the record
-of what did not work is part of the evidence trail, and deleting it would make
-the eventual passing run look luckier than it was.
+Every run on record loses money, and the isolation test above shows why: the
+entry signal does not predict direction well enough to pay for its own stop. It
+stays "no" until a run appears above with ACCEPTANCE: PASS. These failing runs
+are committed deliberately: the record of what did not work is part of the
+evidence trail, and deleting it would make the eventual passing run look luckier
+than it was.
+
+The realistic paths from here are a different entry signal, or no challenge
+purchase. Continuing to tune this one would produce a profitable-looking 2025
+curve fitted to 2025's noise, which is worse than useless — it would buy a
+challenge on evidence that does not generalise.
