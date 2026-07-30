@@ -130,7 +130,7 @@ Commit timestamps serve as ownership proof for FundingPips verification:
 - Sprint 1: RiskManager Layer + unit tests
 - Sprint 2: AsianRange + SignalEngine + tests
 - Sprint 3: Main EA + NewsFilter + ATR trailing + partial close
-- Sprint 4: BacktestValidator + optimization results
+- Sprint 4: BacktestValidator + backtest acceptance criteria
 
 ## License
 
