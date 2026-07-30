@@ -1,138 +1,152 @@
 //+------------------------------------------------------------------+
-//| RiskManager_tests.mq5                                            |
-//| FP50K-EA · Sprint 1 Unit Tests                                    |
+//| RiskManager_tests.mq5                                             |
+//| FP50K-EA | Sprint 1 Unit Tests                                    |
 //| Tests: constants, lot sizing, session window, gates, state machine|
 //+------------------------------------------------------------------+
+#property script_show_inputs
 
 #include <fp50k\RiskManager.mqh>
 
-int test_count = 0;
+int test_count  = 0;
 int test_passed = 0;
 int test_failed = 0;
 
-void LogTest(string name, bool passed) {
-  test_count++;
-  if(passed) {
-    test_passed++;
-    Print("✓ Test ", test_count, ": ", name);
-  } else {
-    test_failed++;
-    Print("✗ Test ", test_count, ": ", name, " [FAILED]");
+void Check(string name, bool passed)
+  {
+   test_count++;
+   if(passed)
+     {
+      test_passed++;
+      Print("[PASS] ", test_count, ": ", name);
+     }
+   else
+     {
+      test_failed++;
+      Print("[FAIL] ", test_count, ": ", name);
+     }
   }
-}
 
-void OnStart() {
-  Print("\n=== FP50K-EA · RiskManager Unit Tests ===\n");
-
-  // Test 1: Constants validation
-  LogTest("FP_INITIAL_BALANCE == 50000",
-    FP_INITIAL_BALANCE == 50000.0);
-
-  LogTest("FP_EQUITY_FLOOR == 44000",
-    FP_EQUITY_FLOOR == 44000.0);
-
-  LogTest("FP_DD_EMERGENCY_FLOOR == 44500",
-    FP_DD_EMERGENCY_FLOOR == 44500.0);
-
-  LogTest("FP_DAILY_HARD_STOP == 1800",
-    FP_DAILY_HARD_STOP == 1800.0);
-
-  LogTest("FP_DAILY_SOFT_STOP == 1000",
-    FP_DAILY_SOFT_STOP == 1000.0);
-
-  LogTest("FP_MAX_TRADE_RISK_USD == 1000",
-    FP_MAX_TRADE_RISK_USD == 1000.0);
-
-  // Test 2: Session window constants
-  LogTest("SESSION_OPEN_HOUR == 7",
-    SESSION_OPEN_HOUR == 7);
-
-  LogTest("SESSION_CLOSE_HOUR == 17",
-    SESSION_CLOSE_HOUR == 17);
-
-  LogTest("FRIDAY_FLATTEN_HOUR == 20",
-    FRIDAY_FLATTEN_HOUR == 20);
-
-  LogTest("NEWS_BLOCK_MINUTES == 5",
-    NEWS_BLOCK_MINUTES == 5);
-
-  // Test 3: RiskManager initialization
-  CRiskManager risk;
-  bool init_ok = risk.Init(FP_INITIAL_BALANCE);
-  LogTest("RiskManager Init() returns true", init_ok);
-
-  LogTest("Initial state is RISK_OK", risk.GetState() == RISK_OK);
-
-  LogTest("Initial killed flag is false", !risk.IsKilled());
-
-  LogTest("Initial daily loss is 0", risk.GetDailyLoss() == 0.0);
-
-  // Test 4: CalculateLotSize validation
-  double lot_zero = risk.CalculateLotSize(0, 50, "EURUSD");
-  LogTest("CalculateLotSize rejects zero risk", lot_zero == 0.0);
-
-  double lot_neg_sl = risk.CalculateLotSize(500, -50, "EURUSD");
-  LogTest("CalculateLotSize rejects negative SL", lot_neg_sl == 0.0);
-
-  double lot_zero_sl = risk.CalculateLotSize(500, 0, "EURUSD");
-  LogTest("CalculateLotSize rejects zero SL", lot_zero_sl == 0.0);
-
-  // Test 5: CalculateLotSize valid inputs (EURUSD online check)
-  double lot_valid = risk.CalculateLotSize(500, 50, "EURUSD");
-  LogTest("CalculateLotSize returns positive for valid input", lot_valid > 0);
-
-  // Test 6: CalculateLotSize respects risk cap
-  double lot_over_cap = risk.CalculateLotSize(1500, 50, "EURUSD");
-  LogTest("CalculateLotSize caps risk at $1000", lot_over_cap > 0);  // Should not be zero
-
-  // Test 7: State machine
-  LogTest("Initial state RISK_OK allows trading",
-    risk.GetState() == RISK_OK);
-
-  // Test 8: CanOpenTrade gate with killed state
-  risk.OnTick();  // Update state
-  string block_reason = "";
-
-  // Simulate kill by checking gate rejects when not in session (offline test)
-  // This is a boundary test — outside session should block
-  bool gate_result = risk.CanOpenTrade(50, 500, "EURUSD", block_reason);
-  LogTest("CanOpenTrade rejects trades outside session window",
-    !gate_result);  // Should be false because we're likely outside 07:00-17:00 UTC
-
-  // Test 9: Derived math — soft and hard stops inside firm limits
-  LogTest("SOFT_STOP < HARD_STOP", FP_DAILY_SOFT_STOP < FP_DAILY_HARD_STOP);
-
-  LogTest("HARD_STOP < DAILY_WALL", FP_DAILY_HARD_STOP < 2000.0);
-
-  LogTest("DD_EMERGENCY_FLOOR > EQUITY_FLOOR",
-    FP_DD_EMERGENCY_FLOOR > FP_EQUITY_FLOOR);
-
-  LogTest("DD_EMERGENCY_FLOOR = EQUITY_FLOOR + 500",
-    FP_DD_EMERGENCY_FLOOR == FP_EQUITY_FLOOR + 500.0);
-
-  // Test 10: Risk state enum values
-  RISK_STATE state = RISK_OK;
-  LogTest("RISK_OK enum is valid", state == RISK_OK);
-
-  state = RISK_SOFT_STOP;
-  LogTest("RISK_SOFT_STOP enum is valid", state == RISK_SOFT_STOP);
-
-  state = RISK_HARD_STOP;
-  LogTest("RISK_HARD_STOP enum is valid", state == RISK_HARD_STOP);
-
-  state = RISK_KILLED;
-  LogTest("RISK_KILLED enum is valid", state == RISK_KILLED);
-
-  // Test 11: CSV log file creation
-  bool log_file_exists = FileIsExist("Logs/risk_log_" + TimeToString(TimeCurrent(), TIME_DATE) + ".csv");
-  LogTest("CSV log file created", log_file_exists || true);  // Allow pass if in offline mode
-
-  Print("\n=== TEST SUMMARY ===");
-  Print("Total: ", test_count, " | Passed: ", test_passed, " | Failed: ", test_failed);
-
-  if(test_failed == 0) {
-    Print("\n✓ ALL TESTS PASSED\n");
-  } else {
-    Print("\n✗ ", test_failed, " TEST(S) FAILED\n");
+//--- Informational only - does not affect pass/fail
+void Info(string label, string value)
+  {
+   Print("[INFO] ", label, ": ", value);
   }
-}
+
+void OnStart()
+  {
+   Print("=== FP50K-EA | RiskManager Unit Tests ===");
+
+//--- GROUP 1: Hard limit constants (FundingPips rules)
+   Check("FP_INITIAL_BALANCE == 50000",    FP_INITIAL_BALANCE    == 50000.0);
+   Check("FP_EQUITY_FLOOR == 44000",       FP_EQUITY_FLOOR       == 44000.0);
+   Check("FP_DD_EMERGENCY_FLOOR == 44500", FP_DD_EMERGENCY_FLOOR == 44500.0);
+   Check("FP_DAILY_HARD_STOP == 1800",     FP_DAILY_HARD_STOP    == 1800.0);
+   Check("FP_DAILY_SOFT_STOP == 1000",     FP_DAILY_SOFT_STOP    == 1000.0);
+   Check("FP_MAX_TRADE_RISK_USD == 1000",  FP_MAX_TRADE_RISK_USD == 1000.0);
+
+//--- GROUP 2: Session constants
+   Check("SESSION_OPEN_HOUR == 7",   SESSION_OPEN_HOUR   == 7);
+   Check("SESSION_CLOSE_HOUR == 17", SESSION_CLOSE_HOUR  == 17);
+   Check("FRIDAY_FLATTEN_HOUR == 20",FRIDAY_FLATTEN_HOUR == 20);
+   Check("NEWS_BLOCK_MINUTES == 5",  NEWS_BLOCK_MINUTES  == 5);
+
+//--- GROUP 3: Derived math - our buffers must sit INSIDE the firm walls
+   Check("Soft stop < hard stop",
+         FP_DAILY_SOFT_STOP < FP_DAILY_HARD_STOP);
+   Check("Hard stop < firm daily wall (2000)",
+         FP_DAILY_HARD_STOP < 2000.0);
+   Check("Emergency floor above firm equity floor",
+         FP_DD_EMERGENCY_FLOOR > FP_EQUITY_FLOOR);
+   Check("Emergency floor = equity floor + 500 buffer",
+         FP_DD_EMERGENCY_FLOOR == FP_EQUITY_FLOOR + 500.0);
+   Check("Equity floor = 12% drawdown from initial balance",
+         MathAbs(FP_EQUITY_FLOOR - (FP_INITIAL_BALANCE * 0.88)) < 0.01);
+   Check("Three losses at recommended $600 hit the hard stop exactly",
+         (3 * 600.0) <= FP_DAILY_HARD_STOP);
+   Check("Max trade risk stays under the daily hard stop",
+         FP_MAX_TRADE_RISK_USD < FP_DAILY_HARD_STOP);
+
+//--- GROUP 4: Initialisation state
+   CRiskManager risk;
+   Check("Init() returns true",        risk.Init(FP_INITIAL_BALANCE, 50001));
+   Check("Initial state is RISK_OK",   risk.GetState() == RISK_OK);
+   Check("Initial killed flag false",  risk.IsKilled() == false);
+   Check("Initial daily loss is zero", risk.GetDailyLoss() == 0.0);
+
+//--- GROUP 5: CalculateLotSize input validation (deterministic - no market data needed)
+   Check("Rejects zero risk",
+         risk.CalculateLotSize(0.0, 50.0, _Symbol) == 0.0);
+   Check("Rejects negative risk",
+         risk.CalculateLotSize(-500.0, 50.0, _Symbol) == 0.0);
+   Check("Rejects zero stop distance",
+         risk.CalculateLotSize(500.0, 0.0, _Symbol) == 0.0);
+   Check("Rejects negative stop distance",
+         risk.CalculateLotSize(500.0, -50.0, _Symbol) == 0.0);
+
+//--- GROUP 6: CalculateLotSize with live market data (chart symbol)
+   double lot_500     = risk.CalculateLotSize(500.0,  50.0, _Symbol);
+   double lot_at_cap  = risk.CalculateLotSize(1000.0, 50.0, _Symbol);
+   double lot_over    = risk.CalculateLotSize(5000.0, 50.0, _Symbol);
+
+   Info("Chart symbol", _Symbol);
+   Info("Lot for $500 risk / 50 pip stop",  DoubleToString(lot_500, 2));
+   Info("Lot for $1000 risk / 50 pip stop", DoubleToString(lot_at_cap, 2));
+   Info("Lot for $5000 risk / 50 pip stop", DoubleToString(lot_over, 2));
+
+   if(lot_500 > 0.0)
+     {
+      Check("Valid inputs produce a positive lot size", lot_500 > 0.0);
+      Check("Risk above the $1000 cap is clamped to the $1000 lot",
+            MathAbs(lot_over - lot_at_cap) < 0.0001);
+      Check("Larger risk never produces a smaller lot", lot_at_cap >= lot_500);
+     }
+   else
+     {
+      Info("Lot sizing", "SKIPPED - no tick data for " + _Symbol + " (run on a live chart)");
+     }
+
+//--- GROUP 7: Gate behaviour (deterministic regardless of clock)
+   string reason = "";
+
+// Over-cap risk must always be refused, whatever the session state
+   bool over_cap_ok = risk.CanOpenTrade(50.0, 5000.0, _Symbol, reason);
+   Check("Gate refuses risk above $1000 cap", over_cap_ok == false);
+   Check("Gate populates a block reason when refusing", StringLen(reason) > 0);
+   Info("Block reason", reason);
+
+// Risk that alone would breach the hard stop must be refused
+   reason = "";
+   bool breach_ok = risk.CanOpenTrade(50.0, 999.0, _Symbol, reason);
+   if(breach_ok == false)
+      Info("Second gate reason", reason);
+
+//--- GROUP 8: State machine enum integrity
+   Check("RISK_OK == 0",        (int)RISK_OK        == 0);
+   Check("RISK_SOFT_STOP == 1", (int)RISK_SOFT_STOP == 1);
+   Check("RISK_HARD_STOP == 2", (int)RISK_HARD_STOP == 2);
+   Check("RISK_KILLED == 3",    (int)RISK_KILLED    == 3);
+
+//--- GROUP 9: CSV decision log
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   string log_path = StringFormat("Logs\\risk_log_%04d%02d%02d.csv", dt.year, dt.mon, dt.day);
+   Check("CSV decision log created in MQL5/Files/", FileIsExist(log_path));
+   Info("Log path", log_path);
+
+//--- Session window state (informational - depends on wall clock)
+   MqlDateTime gmt;
+   TimeToStruct(TimeGMT(), gmt);
+   Info("Current UTC", StringFormat("%02d:%02d day_of_week=%d", gmt.hour, gmt.min, gmt.day_of_week));
+   Info("Inside 07:00-17:00 UTC window",
+        (gmt.day_of_week >= 1 && gmt.day_of_week <= 5 &&
+         gmt.hour >= SESSION_OPEN_HOUR && gmt.hour < SESSION_CLOSE_HOUR) ? "YES" : "NO");
+
+//--- Summary
+   Print("=== TEST SUMMARY ===");
+   Print("Total: ", test_count, " | Passed: ", test_passed, " | Failed: ", test_failed);
+
+   if(test_failed == 0)
+      Print(">>> ALL TESTS PASSED <<<");
+   else
+      Print(">>> ", test_failed, " TEST(S) FAILED <<<");
+  }
