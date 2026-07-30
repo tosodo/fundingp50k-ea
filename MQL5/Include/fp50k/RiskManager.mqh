@@ -58,12 +58,13 @@ private:
   int        m_log_file;
   string     m_log_filename;
 
+  // Magic number for position filtering
+  ulong      m_magic_number;
+
   // Helper methods
   bool   IsNewsBlackout(string symbol);
   bool   IsInsideSessionWindow();
   bool   IsFridayFlatten();
-  double PipToUSD(string symbol, double pips);
-  double GetLiveSpread(string symbol);
   void   LogDecision(string symbol, string decision, double equity, double daily_loss, bool blocked);
   void   WriteCSVHeader();
 
@@ -71,7 +72,7 @@ public:
   CRiskManager();
   ~CRiskManager();
 
-  bool   Init(double initial_balance = FP_INITIAL_BALANCE);
+  bool   Init(double initial_balance = FP_INITIAL_BALANCE, ulong magic = 50001);
   void   OnNewDay();
   void   OnTick();
   bool   CanOpenTrade(double sl_pips, double risk_usd, string symbol, string &block_reason);
@@ -93,6 +94,7 @@ CRiskManager::CRiskManager() {
   m_daily_loss_usd = 0.0;
   m_starting_equity = FP_INITIAL_BALANCE;
   m_log_file = -1;
+  m_magic_number = 50001;
 }
 
 //--- Destructor
@@ -103,12 +105,13 @@ CRiskManager::~CRiskManager() {
 }
 
 //--- Init: Called once at EA start
-bool CRiskManager::Init(double initial_balance) {
+bool CRiskManager::Init(double initial_balance, ulong magic) {
   m_starting_equity = initial_balance;
   m_daily_loss_usd = 0.0;
   m_state = RISK_OK;
   m_killed = false;
   m_last_day = TimeCurrent();
+  m_magic_number = magic;
 
   // Create log file
   m_log_filename = StringFormat("Logs/risk_log_%04d%02d%02d.csv",
@@ -127,10 +130,14 @@ bool CRiskManager::Init(double initial_balance) {
 
 //--- OnNewDay: Called when date changes
 void CRiskManager::OnNewDay() {
-  if(TimeDay(TimeCurrent()) != TimeDay(m_last_day)) {
+  datetime current_time = TimeCurrent();
+  string current_date = TimeToString(current_time, TIME_DATE);
+  string last_date = TimeToString(m_last_day, TIME_DATE);
+
+  if(current_date != last_date) {
     m_daily_loss_usd = 0.0;
     m_state = RISK_OK;
-    m_last_day = TimeCurrent();
+    m_last_day = current_time;
     Print("[RiskManager] New trading day. Daily loss reset to $0.");
   }
 }
@@ -326,7 +333,7 @@ void CRiskManager::KillSwitch() {
 
   for(int i = total - 1; i >= 0; i--) {
     ulong ticket = PositionGetTicket(i);
-    if(PositionGetInteger(POSITION_MAGIC) == trade.GetMagicNumber()) {
+    if(PositionGetInteger(POSITION_MAGIC) == m_magic_number) {
       trade.PositionClose(ticket);
     }
   }
@@ -346,7 +353,7 @@ void CRiskManager::FridayFlatten() {
     Print("[RiskManager] Friday close-all: closing ", total, " positions before weekend.");
     for(int i = total - 1; i >= 0; i--) {
       ulong ticket = PositionGetTicket(i);
-      if(PositionGetInteger(POSITION_MAGIC) == trade.GetMagicNumber()) {
+      if(PositionGetInteger(POSITION_MAGIC) == m_magic_number) {
         trade.PositionClose(ticket);
       }
     }
