@@ -72,6 +72,55 @@ void OnStart()
    Check("Initial state is RISK_OK",   risk.GetState() == RISK_OK);
    Check("Initial killed flag false",  risk.IsKilled() == false);
    Check("Initial daily loss is zero", risk.GetDailyLoss() == 0.0);
+   Check("Init anchors the day to the starting balance",
+         risk.GetDayAnchor() == FP_INITIAL_BALANCE);
+
+//--- GROUP 4b: The daily allowance resets every day.
+//    "Daily loss" must be measured from the equity TODAY opened at, not from
+//    the balance the challenge began with. Anchored to the start balance
+//    instead, a bad week would leave the EA permanently hard-stopped and a
+//    good week would hand it an allowance far larger than the firm grants.
+   Check("Daily loss is the fall from the day's opening equity",
+         CRiskManager::DailyLossFrom(50000.0, 49000.0) == 1000.0);
+   Check("A day in profit reports a negative loss, not zero",
+         CRiskManager::DailyLossFrom(50000.0, 51000.0) == -1000.0);
+
+   Check("No loss leaves the state OK",
+         CRiskManager::StateFromDailyLoss(0.0) == RISK_OK);
+   Check("A dollar under the soft stop is still OK",
+         CRiskManager::StateFromDailyLoss(999.0) == RISK_OK);
+   Check("Exactly $1000 triggers the soft stop",
+         CRiskManager::StateFromDailyLoss(FP_DAILY_SOFT_STOP) == RISK_SOFT_STOP);
+   Check("A dollar under the hard stop is still only a soft stop",
+         CRiskManager::StateFromDailyLoss(1799.0) == RISK_SOFT_STOP);
+   Check("Exactly $1800 triggers the hard stop",
+         CRiskManager::StateFromDailyLoss(FP_DAILY_HARD_STOP) == RISK_HARD_STOP);
+   Check("A loss past the hard stop stays hard-stopped",
+         CRiskManager::StateFromDailyLoss(5000.0) == RISK_HARD_STOP);
+
+   Check("A new day re-anchors to that morning's equity",
+         CRiskManager::NextDayAnchor(50000.0, 48000.0) == 48000.0);
+   Check("A profitable week moves the anchor up too",
+         CRiskManager::NextDayAnchor(50000.0, 52000.0) == 52000.0);
+   Check("A zero equity reading keeps the previous anchor",
+         CRiskManager::NextDayAnchor(50000.0, 0.0) == 50000.0,
+         "an offline terminal reads equity as 0.00 - re-anchoring there would "
+         "report an instant $50,000 loss");
+   Check("A negative equity reading keeps the previous anchor",
+         CRiskManager::NextDayAnchor(50000.0, -5.0) == 50000.0);
+
+// The regression this guards. Down $2,000 over an earlier week, the account
+// sits at $48,000 and opens a new day. Losing $1,000 today is a soft stop and
+// nothing worse. Measured from the original $50,000 it would read as a $3,000
+// loss and hard-stop the EA on a day it had done nothing wrong.
+   double anchor_today = CRiskManager::NextDayAnchor(FP_INITIAL_BALANCE, 48000.0);
+   Check("After a losing week, today's $1,000 loss is only a soft stop",
+         CRiskManager::StateFromDailyLoss(
+           CRiskManager::DailyLossFrom(anchor_today, 47000.0)) == RISK_SOFT_STOP);
+   Check("Measured from the start balance instead, the same day would hard-stop",
+         CRiskManager::StateFromDailyLoss(
+           CRiskManager::DailyLossFrom(FP_INITIAL_BALANCE, 47000.0)) == RISK_HARD_STOP,
+         "this is the behaviour the day anchor exists to prevent");
 
 //--- GROUP 5: CalculateLotSize input validation (deterministic - no market data needed)
    Check("Rejects zero risk",

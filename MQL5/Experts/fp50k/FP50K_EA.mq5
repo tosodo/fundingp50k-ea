@@ -22,6 +22,7 @@
 #include <fp50k\RiskManager.mqh>
 #include <fp50k\SignalEngine.mqh>
 #include <fp50k\NewsFilter.mqh>
+#include <fp50k\BacktestValidator.mqh>
 
 //--- Risk
 input double   InpRiskUSD       = 500.0;   // Risk per trade (USD)
@@ -44,6 +45,11 @@ CRiskManager  g_risk;
 CSignalEngine g_signal_eur;
 CSignalEngine g_signal_gbp;
 CTrade        g_trade;
+
+//--- Backtest validation overlay. Observes only, and only inside the Strategy
+//    Tester - it must never add work to a live tick.
+CBacktestValidator g_validator;
+bool               g_in_tester = false;
 
 //--- Per-symbol new-bar tracking
 datetime g_last_bar_eur = 0;
@@ -231,6 +237,13 @@ int OnInit() {
 
   RecoverPartialState();
 
+  g_in_tester = (MQLInfoInteger(MQL_TESTER) != 0);
+  if(g_in_tester) {
+    double deposit = AccountInfoDouble(ACCOUNT_BALANCE);
+    if(deposit <= 0.0) deposit = FP_INITIAL_BALANCE;
+    g_validator.Init(deposit);
+  }
+
   Print("[FP50K] FP50K_EA initialised | Risk=$", DoubleToString(InpRiskUSD, 2),
         " | RR=", DoubleToString(InpRRRatio, 1),
         " | Magic=", InpMagicNumber,
@@ -243,6 +256,8 @@ int OnInit() {
 //| OnDeinit                                                         |
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason) {
+  if(g_in_tester) g_validator.Report((ulong)InpMagicNumber);
+
   if(g_atr_eur != INVALID_HANDLE) IndicatorRelease(g_atr_eur);
   if(g_atr_gbp != INVALID_HANDLE) IndicatorRelease(g_atr_gbp);
 
@@ -456,6 +471,15 @@ void ProcessSymbol(string symbol, CSignalEngine *engine, datetime &last_bar) {
 //| OnTick                                                           |
 //+------------------------------------------------------------------+
 void OnTick() {
+  // 0. Backtest bookkeeping. Sampled before anything else so the equity low
+  //    of a tick is recorded even if the governor kills the EA on that tick.
+  if(g_in_tester) {
+    g_validator.Feed(TimeCurrent(),
+                     AccountInfoDouble(ACCOUNT_EQUITY),
+                     AccountInfoDouble(ACCOUNT_BALANCE));
+    g_validator.NoteNewsBlock(g_risk.News().LastBlockTime());
+  }
+
   // 1. Risk governor state machine first, always. It owns the daily reset,
   //    the drawdown kill and the Friday flatten.
   g_risk.OnTick();
@@ -472,4 +496,22 @@ void OnTick() {
   // 3. Look for new entries.
   if(InpTradeEURUSD) ProcessSymbol(SYM_EUR, GetPointer(g_signal_eur), g_last_bar_eur);
   if(InpTradeGBPUSD) ProcessSymbol(SYM_GBP, GetPointer(g_signal_gbp), g_last_bar_gbp);
+}
+
+//+------------------------------------------------------------------+
+//| OnTester - the value the Strategy Tester's optimiser maximises    |
+//+------------------------------------------------------------------+
+//
+// Left to itself the optimiser maximises net profit, and the most profitable
+// parameter set is very often one that breaks a challenge rule on the way.
+// This returns zero for any run that breached the daily wall or the equity
+// floor, so those settings can never win an optimisation.
+double OnTester() {
+  g_validator.Finalise((ulong)InpMagicNumber);
+  double score = g_validator.OptimisationScore();
+  Print("[FP50K] OnTester score=", DoubleToString(score, 2),
+        " | compliance=", (g_validator.CompliancePassed() ? "PASS" : "FAIL"),
+        " | trades=", g_validator.Trades(),
+        " | maxDD=", DoubleToString(g_validator.MaxDDPct(), 2), "%");
+  return score;
 }

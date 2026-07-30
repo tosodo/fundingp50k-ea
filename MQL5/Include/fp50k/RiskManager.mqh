@@ -43,9 +43,11 @@ private:
   bool       m_killed;
   datetime   m_last_day;
 
-  // Daily accumulator
+  // Daily accumulator. m_day_anchor_equity is the equity the CURRENT day
+  // opened at, not the equity the challenge started at - the firm grants a
+  // fresh daily allowance every day, so the anchor has to move with it.
   double     m_daily_loss_usd;
-  double     m_starting_equity;
+  double     m_day_anchor_equity;
 
   // Log file
   int        m_log_file;
@@ -76,10 +78,35 @@ public:
   void   KillSwitch();
   void   FridayFlatten();
 
+  // Pure helpers - no account access, so tests can drive them with known
+  // numbers instead of needing a live balance the sandbox does not have.
+
+  // Loss so far today, measured from the day's opening equity. Positive means
+  // down on the day; negative means up on the day.
+  static double DailyLossFrom(double day_anchor, double equity) {
+    return day_anchor - equity;
+  }
+
+  // Which gate the day's loss puts us behind.
+  static RISK_STATE StateFromDailyLoss(double daily_loss) {
+    if(daily_loss >= FP_DAILY_HARD_STOP) return RISK_HARD_STOP;
+    if(daily_loss >= FP_DAILY_SOFT_STOP) return RISK_SOFT_STOP;
+    return RISK_OK;
+  }
+
+  // The equity a new day should measure its loss from. A non-positive reading
+  // means there is no account state to read - an offline terminal, or a script
+  // with no login - and re-anchoring to zero there would report a $50,000 loss
+  // and hard-stop instantly. In that case the previous anchor is kept.
+  static double NextDayAnchor(double prev_anchor, double equity) {
+    return (equity > 0.0) ? equity : prev_anchor;
+  }
+
   // Getters
   RISK_STATE GetState() { return m_state; }
   bool       IsKilled() { return m_killed; }
   double     GetDailyLoss() { return m_daily_loss_usd; }
+  double     GetDayAnchor() { return m_day_anchor_equity; }
 
   // Exposed so the EA can reuse the same cached calendar for its pre-news
   // position close, rather than opening a second one and paying the fetch twice.
@@ -92,7 +119,7 @@ CRiskManager::CRiskManager() {
   m_killed = false;
   m_last_day = 0;
   m_daily_loss_usd = 0.0;
-  m_starting_equity = FP_INITIAL_BALANCE;
+  m_day_anchor_equity = FP_INITIAL_BALANCE;
   m_log_file = INVALID_HANDLE;
   m_magic_number = 50001;
 }
@@ -107,7 +134,7 @@ CRiskManager::~CRiskManager() {
 
 //--- Init: Called once at EA start
 bool CRiskManager::Init(double initial_balance, ulong magic) {
-  m_starting_equity = initial_balance;
+  m_day_anchor_equity = initial_balance;
   m_daily_loss_usd = 0.0;
   m_state = RISK_OK;
   m_killed = false;
@@ -142,10 +169,17 @@ void CRiskManager::OnNewDay() {
   string last_date = TimeToString(m_last_day, TIME_DATE);
 
   if(current_date != last_date) {
+    // Re-anchor to today's opening equity. Without this the "daily" loss is
+    // really the loss since the challenge began, which never resets - one bad
+    // week would hard-stop the EA permanently, and a good week would hand it
+    // an allowance far larger than the firm actually grants.
+    m_day_anchor_equity = NextDayAnchor(m_day_anchor_equity,
+                                        AccountInfoDouble(ACCOUNT_EQUITY));
     m_daily_loss_usd = 0.0;
     m_state = RISK_OK;
     m_last_day = current_time;
-    Print("[RiskManager] New trading day. Daily loss reset to $0.");
+    Print("[RiskManager] New trading day. Daily loss reset to $0. Anchor equity $",
+          DoubleToString(m_day_anchor_equity, 2));
   }
 }
 
@@ -162,21 +196,26 @@ void CRiskManager::OnTick() {
     return;
   }
 
-  // Check daily loss accumulation
-  double current_daily_loss = m_starting_equity - AccountInfoDouble(ACCOUNT_EQUITY);
-  m_daily_loss_usd = current_daily_loss;
+  // Check daily loss accumulation, measured from today's opening equity
+  m_daily_loss_usd = DailyLossFrom(m_day_anchor_equity,
+                                   AccountInfoDouble(ACCOUNT_EQUITY));
 
-  if(m_daily_loss_usd >= FP_DAILY_HARD_STOP) {
-    m_state = RISK_HARD_STOP;
-    Print("[RiskManager] HARD STOP: Daily loss $", m_daily_loss_usd, " >= $",
-          FP_DAILY_HARD_STOP, ". No new entries.");
-  } else if(m_daily_loss_usd >= FP_DAILY_SOFT_STOP) {
-    m_state = RISK_SOFT_STOP;
-    Print("[RiskManager] SOFT STOP: Daily loss $", m_daily_loss_usd, " >= $",
-          FP_DAILY_SOFT_STOP, ". No new entries.");
-  } else {
-    m_state = RISK_OK;
+  RISK_STATE new_state = StateFromDailyLoss(m_daily_loss_usd);
+
+  // Log only on transition. This runs every tick, and printing the same
+  // stop message thousands of times buries everything else in the journal.
+  if(new_state != m_state) {
+    if(new_state == RISK_HARD_STOP)
+      Print("[RiskManager] HARD STOP: Daily loss $", DoubleToString(m_daily_loss_usd, 2),
+            " >= $", FP_DAILY_HARD_STOP, ". No new entries.");
+    else if(new_state == RISK_SOFT_STOP)
+      Print("[RiskManager] SOFT STOP: Daily loss $", DoubleToString(m_daily_loss_usd, 2),
+            " >= $", FP_DAILY_SOFT_STOP, ". No new entries.");
+    else
+      Print("[RiskManager] Daily loss back under the soft stop ($",
+            DoubleToString(m_daily_loss_usd, 2), "). Entries re-enabled.");
   }
+  m_state = new_state;
 
   // Check Friday close-all
   if(IsFridayFlatten()) {
