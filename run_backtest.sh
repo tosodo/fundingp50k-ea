@@ -77,9 +77,14 @@ fi
 # Wine mishandles spaces in argv; C:\mt5 is a space-free route to the same place.
 ln -sfn "$MT5_DIR" "$WINE_PREFIX/drive_c/mt5" 2>/dev/null
 
+# Without this, wine uses its own default prefix, finds no terminal64.exe, and
+# exits silently with status 0 — a no-op that reads exactly like a finished run.
+export WINEPREFIX="$WINE_PREFIX"
+
 #--- Tester config ------------------------------------------------------------
-INI_PATH="$MT5_DIR/config/fp50k_tester.ini"
-mkdir -p "$MT5_DIR/config"
+# Kept at the drive root, not in config/, for the same space-free-path reason.
+INI_PATH="$MT5_DIR/fp50k_tester.ini"
+INI_WIN="C:\\mt5\\fp50k_tester.ini"
 
 cat > "$INI_PATH" <<EOF
 [Common]
@@ -124,13 +129,37 @@ echo "=============================================================="
 
 rm -f "$SUMMARY_FILE" 2>/dev/null
 
+# Byte offset of today's log before launch, so the collection step can show
+# only what this run appended. The offset lands on an even byte because the
+# file is complete, so the UTF-16LE decode stays aligned.
+TODAY_LOG="$MT5_DIR/logs/$(date +%Y%m%d).log"
+LOG_OFFSET=0
+[ -f "$TODAY_LOG" ] && LOG_OFFSET=$(wc -c < "$TODAY_LOG" | tr -d ' ')
+
 START_EPOCH=$(date +%s)
-"$WINE_BIN" "C:\\mt5\\terminal64.exe" "/config:C:\\mt5\\config\\fp50k_tester.ini" >/dev/null 2>&1 &
+"$WINE_BIN" "C:\\mt5\\terminal64.exe" "/config:$INI_WIN" >/dev/null 2>&1 &
+disown 2>/dev/null || true
+
+#--- Confirm it actually started ----------------------------------------------
+# "Process is gone" is the completion signal below, but a launch that no-ops
+# also leaves no process — indistinguishable, and it reads as a finished run
+# that produced nothing. So require the process to appear first.
+STARTED=0
+for _ in $(seq 1 120); do
+    if pgrep -f "terminal64.exe" >/dev/null 2>&1; then STARTED=1; break; fi
+    sleep 1
+done
+if [ "$STARTED" -ne 1 ]; then
+    echo "ERROR: terminal64.exe never started — the launch silently no-opped." >&2
+    echo "       Check WINEPREFIX, the C:\\mt5 symlink, and $INI_PATH." >&2
+    exit 4
+fi
+echo "Terminal up. Tester running."
 
 #--- Wait ---------------------------------------------------------------------
 # ShutdownTerminal=1 means the terminal exits by itself when the run finishes,
 # so the process disappearing is the completion signal.
-echo "Running. Polling every 30s..."
+echo "Polling every 30s..."
 ELAPSED=0
 while [ "$ELAPSED" -lt "$WAIT_SECS" ]; do
     sleep 30
@@ -163,12 +192,16 @@ fi
 echo "=============================================================="
 echo "  TESTER LOG (last lines)"
 echo "=============================================================="
-TESTER_LOG=$(ls -t "$MT5_DIR/Tester/"*/logs/*.log 2>/dev/null | head -1)
+# Only this run's lines. The day log is never cleared, so tailing it whole
+# shows yesterday's chatter and passes it off as today's result.
+TESTER_LOG=$(find "$MT5_DIR/Tester" -name '*.log' -newermt "@$START_EPOCH" 2>/dev/null | head -1)
 if [ -n "$TESTER_LOG" ]; then
     iconv -f UTF-16LE -t UTF-8 "$TESTER_LOG" 2>/dev/null | tail -n 60
 else
-    LOG=$(ls -t "$MT5_DIR/logs/"*.log 2>/dev/null | grep -v metaeditor | head -1)
-    [ -n "$LOG" ] && iconv -f UTF-16LE -t UTF-8 "$LOG" 2>/dev/null | tail -n 60
+    echo "(no tester log written this run — showing terminal log since launch)"
+    LOG="$MT5_DIR/logs/$(date +%Y%m%d).log"
+    [ -f "$LOG" ] && tail -c "+$((LOG_OFFSET + 1))" "$LOG" 2>/dev/null \
+        | iconv -f UTF-16LE -t UTF-8 2>/dev/null | tail -n 60
 fi
 
 REPORT_HTML=$(ls -t "$MT5_DIR/${REPORT_NAME}".htm* 2>/dev/null | head -1)

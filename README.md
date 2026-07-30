@@ -27,6 +27,7 @@ All code in this repository is original work authored and owned by the account h
 | `Docs/backtest_results.md` | Backtest acceptance criteria + run log | 4 |
 | `sync_to_mt5.sh` | Copies source into the Wine MT5 install | 1 |
 | `run_tests.sh` | Headless compile + test runner | 2 |
+| `run_backtest.sh` | Headless Strategy Tester runner | 4 |
 
 ## Risk Parameters (FundingPips $50k 2-Step Flex)
 
@@ -97,10 +98,10 @@ They verify wiring and arithmetic: lot sizing, stop and target placement,
 blackout windows, gate refusals, and — since Sprint 4 — the equity-curve
 accounting that decides whether a simulated run survived the challenge.
 
-They do **not** establish that the strategy is profitable. No historical
-backtest has been run. The Strategy Tester needs a logged-in account and real
-tick history, so it is a manual step in the MetaTrader window; the criteria it
-has to meet, and how to run it, are written down in
+They do **not** establish that the strategy is profitable. The first backtest
+has now been run, and it lost money: **-$5,544 over 2025, profit factor 0.75.**
+It broke none of FundingPips' rules and still failed the acceptance bar. Full
+figures, the diagnosis, and what has to change are in
 [`Docs/backtest_results.md`](Docs/backtest_results.md).
 
 ## Backtest validation (Sprint 4)

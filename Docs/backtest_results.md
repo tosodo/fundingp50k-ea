@@ -1,12 +1,12 @@
 # Backtest Results — FP50K-EA
 
-**Status: NOT YET RUN.**
+**Status: FIRST RUN COMPLETE — ACCEPTANCE: FAIL.**
 
-No historical backtest has been executed. Nothing in this repository yet
-establishes that the strategy is profitable — the unit tests prove the
-arithmetic and the wiring, and stop there. This file exists so the standard the
-run has to meet is written down *before* the run, not chosen afterwards to fit
-whatever came out.
+The strategy loses money as currently configured. One smoke run has been
+executed (2025, EURUSD H1, 1-minute bars) and is recorded below. It broke none
+of FundingPips' rules and still lost $5,544 over the year, so it does not
+justify buying a challenge. The standard below was written down *before* the
+run, not chosen afterwards to fit what came out.
 
 ---
 
@@ -35,9 +35,24 @@ and passing are different things, and the validator reports them separately as
 
 ## How to run it
 
-MetaTrader's Strategy Tester needs a logged-in account and a real price
-history, so this is a manual step in the MetaTrader 5 window — it cannot be
-done headlessly.
+Two ways. The script is the normal one.
+
+### Headless (preferred)
+
+```bash
+./run_backtest.sh smoke   # 2025, 1-minute bars — minutes
+./run_backtest.sh full    # 2022-2025, real ticks — hours
+```
+
+MetaTrader must be **closed** first; it is single-instance and a running copy
+silently swallows the launch. The script refuses to start rather than hang.
+It launches the tester, waits, then prints the validator summary and the path
+to the MT5 HTML report. Settings are overridable by environment variable —
+`BT_SYMBOL`, `BT_FROM`, `BT_TO`, `BT_MODEL`, `BT_DEPOSIT`, `BT_WAIT_SECS`.
+
+The tester is a simulation. It places no orders on any account.
+
+### By hand, in the MetaTrader window
 
 1. Open MetaTrader 5 and make sure you are logged into the broker account.
 2. Open the **Calendar** tab once and let it populate. If the terminal has no
@@ -94,14 +109,79 @@ ACCEPTANCE: ___
 Notes:
 -->
 
-*(No runs recorded yet.)*
+### 2026-07-30 — EURUSD H1, 2025 only, 1-minute bars (SMOKE RUN)
+
+Not an acceptance run. Deliberately cheap and low-fidelity — one year instead
+of four, 1-minute bars instead of real ticks — to answer whether the EA trades
+at all and whether the validator reports, before spending hours on the real
+thing. It answered both, and also produced a result worth acting on.
+
+Settings: deposit $50,000, leverage 1:100, 4,137 H1 bars, 984,920 modelled
+ticks. Run time 14 seconds.
+
+| Metric | Result | Required | Pass? |
+|---|---|---|---|
+| Closed trades | 112 | ≥ 300 | NO |
+| Net profit | **-$5,544.16** | — | NO |
+| Win rate | 60.7% | ≥ 45% | YES |
+| Profit factor | 0.75 | > 1.0 to be viable | NO |
+| Max drawdown | 12.97% | < 8% | NO |
+| Worst daily loss | $1,020.01 | < $1,800 | YES |
+| Daily wall breaches | 0 | 0 | YES |
+| Equity floor breaches | 0 (low $44,455.84) | 0 | YES |
+| Phase 1 reached | never | ≤ 30 sessions | NO |
+| News blackouts observed | **0** | > 0 | NO |
+
+RULE COMPLIANCE: PASS — no wall, stop or floor breach
+ACCEPTANCE: FAIL — does not justify buying a challenge
+
+**Notes — the diagnosis is in two numbers:**
+
+| | |
+|---|---|
+| Average winning trade | **+$238.27** |
+| Average losing trade | **-$479.64** |
+
+That is roughly **0.5:1** reward-to-risk, against a design target of 2:1. The
+entries are not the problem — a 60.7% win rate is good, and gross profit was
+$16,202. The exits are: winners are being cut to about half a risk unit while
+losers run to something near the full stop (largest loss -$534.59 vs largest
+win +$431.84). Winning 6 times out of 10 does not survive losing twice as much
+per loss as you make per win. Prime suspects are the partial close at 1R and
+the ATR trailing stop in `FP50K_EA.mq5` — the trail is plausibly tightening
+onto price and closing the runner before the 2.0–2.5× range target is reached,
+which would remove exactly the large winners the 2:1 maths depends on.
+
+**Zero news blackouts.** The Strategy Tester had no economic calendar data, so
+this run traded straight through every release and never paid the cost of one.
+That makes these numbers *optimistic* — and they are still a loss.
+
+**Two caveats on the failing rows.** "Closed trades 112" fails the ≥ 300 bar
+only because this is one year rather than four; it is not evidence about the
+strategy. The 12.97% drawdown is the real failure: it is peak-to-trough equity
+and it exceeds both the 8% target and the firm's 12% wall. Equity never
+actually reached the $44,000 floor, so no rule was broken — but only because
+the losing run started from a peak above the $50,000 opening balance. Starting
+that same losing sequence from day one would have ended the challenge.
+
+**Validator vs MT5 report:** the validator counted 103 closed trades and
+-$4,962.19, MT5 counted 112 and -$5,544.16. The gap is the partial closes
+being counted differently, plus positions still open when the run ended. Not
+reconciled yet; MT5's figures are the ones quoted in the table above.
+
+**Verdict: do not run the full 4-year acceptance test yet.** It would take
+hours to confirm what this run already shows. Fix the exit logic first, re-run
+the smoke test, and only go to full real ticks once average win exceeds average
+loss.
 
 ---
 
 ## Decision
 
-**Is a challenge purchase justified by the backtest? — Not yet decided.**
+**Is a challenge purchase justified by the backtest? — NO, not on current
+evidence.**
 
-This stays "not yet decided" until at least one run appears above with
-ACCEPTANCE: PASS. A failing run is still worth committing; the record of what
-did not work is part of the evidence trail.
+The only run on record loses money. It stays "no" until a run appears above
+with ACCEPTANCE: PASS. This failing run is committed deliberately: the record
+of what did not work is part of the evidence trail, and deleting it would make
+the eventual passing run look luckier than it was.
