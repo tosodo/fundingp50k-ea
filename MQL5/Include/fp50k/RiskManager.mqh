@@ -10,6 +10,7 @@
 
 #include <Trade/Trade.mqh>
 #include <Trade/SymbolInfo.mqh>
+#include "NewsFilter.mqh"
 
 //--- FundingPips Hard Limits (verified July 2026)
 #define FP_INITIAL_BALANCE     50000.0
@@ -23,7 +24,9 @@
 #define SESSION_OPEN_HOUR      7      // 07:00 UTC - London open
 #define SESSION_CLOSE_HOUR     17     // 17:00 UTC - NY afternoon
 #define FRIDAY_FLATTEN_HOUR    20     // 20:00 UTC Friday - close all before weekend
-#define NEWS_BLOCK_MINUTES     5      // +/-5 min red-folder event blackout
+
+//--- NEWS_BLOCK_MINUTES (+/-5 min red-folder blackout) is defined in
+//    NewsFilter.mqh, which owns the calendar logic this class delegates to.
 
 //--- Risk Manager States
 enum RISK_STATE {
@@ -51,20 +54,11 @@ private:
   // Magic number for position filtering
   ulong      m_magic_number;
 
-  // News calendar cache.
-  // CalendarValueHistory() blocks for ~90s the first time a terminal downloads
-  // the calendar database, and ~2s on the first call of each session. That is
-  // far too slow to sit on the per-trade path, so events are fetched on a timer
-  // and the blackout test itself is pure arithmetic over the cached times.
-  datetime   m_news_times[];
-  string     m_news_names[];
-  string     m_news_curr[];
-  datetime   m_news_refreshed;
-  string     m_news_symbol;
+  // Economic calendar. Owned by CNewsFilter - see NewsFilter.mqh for why the
+  // events are cached rather than queried on demand.
+  CNewsFilter m_news;
 
   // Helper methods
-  void   RefreshNewsCache(string symbol);
-  bool   IsNewsBlackout(string symbol);
   bool   IsInsideSessionWindow();
   bool   IsFridayFlatten();
   void   LogDecision(string symbol, string decision, double equity, double daily_loss, bool blocked);
@@ -86,6 +80,10 @@ public:
   RISK_STATE GetState() { return m_state; }
   bool       IsKilled() { return m_killed; }
   double     GetDailyLoss() { return m_daily_loss_usd; }
+
+  // Exposed so the EA can reuse the same cached calendar for its pre-news
+  // position close, rather than opening a second one and paying the fetch twice.
+  CNewsFilter *News() { return GetPointer(m_news); }
 };
 
 //--- Constructor
@@ -97,8 +95,6 @@ CRiskManager::CRiskManager() {
   m_starting_equity = FP_INITIAL_BALANCE;
   m_log_file = INVALID_HANDLE;
   m_magic_number = 50001;
-  m_news_refreshed = 0;
-  m_news_symbol = "";
 }
 
 //--- Destructor
@@ -134,7 +130,7 @@ bool CRiskManager::Init(double initial_balance, ulong magic) {
 
   // Warm the calendar cache here, at attach time, so the one-off download cost
   // is paid before trading starts rather than stalling a live entry decision.
-  RefreshNewsCache(_Symbol);
+  m_news.Init();
 
   return true;
 }
@@ -222,7 +218,7 @@ bool CRiskManager::CanOpenTrade(double sl_pips, double risk_usd, string symbol, 
   }
 
   // Layer 5: News blackout
-  if(IsNewsBlackout(symbol)) {
+  if(m_news.IsBlackedOut(symbol, NEWS_BLOCK_MINUTES)) {
     block_reason = "High-impact news event within +/-5 min";
     LogDecision(symbol, block_reason, AccountInfoDouble(ACCOUNT_EQUITY), m_daily_loss_usd, true);
     return false;
@@ -381,79 +377,6 @@ void CRiskManager::FridayFlatten() {
       }
     }
   }
-}
-
-//--- RefreshNewsCache: Pull high-impact events for this symbol into memory.
-//    Slow call - only ever invoked from Init() or the 60s refresh timer.
-void CRiskManager::RefreshNewsCache(string symbol) {
-  ArrayFree(m_news_times);
-  ArrayFree(m_news_names);
-  ArrayFree(m_news_curr);
-
-  m_news_symbol    = symbol;
-  m_news_refreshed = TimeCurrent();
-
-  // Base currency is the first 3 chars, quote currency the next 3
-  string base_curr  = StringSubstr(symbol, 0, 3);
-  string quote_curr = StringSubstr(symbol, 3, 3);
-
-  // Fetch a wide window (1h back, 4h forward) so a 60s refresh interval can
-  // never miss an event that is about to enter the blackout band.
-  datetime from = TimeCurrent() - 3600;
-  datetime to   = TimeCurrent() + 4 * 3600;
-
-  MqlCalendarValue values[];
-  int count = CalendarValueHistory(values, from, to);
-
-  for(int i = 0; i < count; i++) {
-    MqlCalendarEvent cal_event;
-    if(!CalendarEventById(values[i].event_id, cal_event)) continue;
-
-    if(cal_event.importance != CALENDAR_IMPORTANCE_HIGH) continue;
-
-    // The currency lives on the country record, not the event record
-    MqlCalendarCountry country;
-    if(!CalendarCountryById(cal_event.country_id, country)) continue;
-
-    if(country.currency != base_curr && country.currency != quote_curr) continue;
-
-    int n = ArraySize(m_news_times);
-    ArrayResize(m_news_times, n + 1);
-    ArrayResize(m_news_names, n + 1);
-    ArrayResize(m_news_curr,  n + 1);
-    m_news_times[n] = values[i].time;
-    m_news_names[n] = cal_event.name;
-    m_news_curr[n]  = country.currency;
-  }
-
-  Print("[RiskManager] News cache refreshed for ", symbol, ": ",
-        ArraySize(m_news_times), " high-impact event(s) in the next 4h.");
-}
-
-//--- IsNewsBlackout: +/-5 min around any cached high-impact event.
-//    Pure arithmetic - safe to call on every tick.
-bool CRiskManager::IsNewsBlackout(string symbol) {
-  // Refresh at most once a minute, or immediately if the symbol changed
-  if(symbol != m_news_symbol || m_news_refreshed == 0 ||
-     TimeCurrent() - m_news_refreshed >= 60) {
-    RefreshNewsCache(symbol);
-  }
-
-  datetime now = TimeCurrent();
-  long block_secs = NEWS_BLOCK_MINUTES * 60;
-
-  for(int i = 0; i < ArraySize(m_news_times); i++) {
-    long delta = (long)now - (long)m_news_times[i];
-    if(delta < 0) delta = -delta;
-
-    if(delta <= block_secs) {
-      Print("[RiskManager] NEWS BLACKOUT: ", m_news_names[i], " (", m_news_curr[i],
-            ") at ", TimeToString(m_news_times[i]), " - blocking entry");
-      return true;
-    }
-  }
-
-  return false;
 }
 
 //--- IsInsideSessionWindow: 07:00-17:00 UTC Monday-Friday

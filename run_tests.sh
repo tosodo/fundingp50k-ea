@@ -60,22 +60,43 @@ fi
 
 OVERALL=0
 
+# Compile the EA itself as part of every run. The test suites only pull in the
+# Include files, so a break in the EA's own wiring would otherwise stay hidden
+# until the moment someone tried to attach it to a chart.
+compile_once() {
+  local rel="$1" out
+  out=$("$COMPILE" "$WINEPREFIX_PATH" "$rel" 2>&1)
+  if ! echo "$out" | grep -q "0 errors, 0 warnings"; then
+    # Retry once. An empty log here is a Wine timing artefact rather than a
+    # real compile error, and the two are indistinguishable at this point.
+    sleep 5
+    out=$("$COMPILE" "$WINEPREFIX_PATH" "$rel" 2>&1)
+  fi
+  if ! echo "$out" | grep -q "0 errors, 0 warnings"; then
+    echo "COMPILE FAILED: $rel"
+    echo "$out" | grep -E "error|warning" || echo "$out" | tail -3
+    return 1
+  fi
+  return 0
+}
+
+if [ $# -eq 0 ] && [ -f "$REPO/MQL5/Experts/fp50k/FP50K_EA.mq5" ]; then
+  echo "=============================================================="
+  echo "  FP50K_EA (compile only - never attached, never run)"
+  echo "=============================================================="
+  if compile_once "MQL5/Experts/fp50k/FP50K_EA.mq5"; then
+    echo "COMPILE: 0 errors, 0 warnings"
+  else
+    OVERALL=1
+  fi
+fi
+
 for TEST in "${TESTS[@]}"; do
   echo "=============================================================="
   echo "  $TEST"
   echo "=============================================================="
 
-  OUT=$("$COMPILE" "$WINEPREFIX_PATH" "MQL5/Scripts/fp50k/$TEST.mq5" 2>&1)
-  if ! echo "$OUT" | grep -q "0 errors, 0 warnings"; then
-    # Retry once. An empty log here is a Wine timing artefact rather than a
-    # real compile error, and the two are indistinguishable at this point.
-    sleep 5
-    OUT=$("$COMPILE" "$WINEPREFIX_PATH" "MQL5/Scripts/fp50k/$TEST.mq5" 2>&1)
-  fi
-
-  if ! echo "$OUT" | grep -q "0 errors, 0 warnings"; then
-    echo "COMPILE FAILED:"
-    echo "$OUT" | grep -E "error|warning" || echo "$OUT" | tail -3
+  if ! compile_once "MQL5/Scripts/fp50k/$TEST.mq5"; then
     OVERALL=1
     continue
   fi

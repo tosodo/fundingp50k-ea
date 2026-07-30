@@ -21,6 +21,7 @@ All code in this repository is original work authored and owned by the account h
 | `MQL5/Experts/fp50k/FP50K_EA.mq5` | Main EA — execution layer | 3 |
 | `MQL5/Scripts/fp50k/RiskManager_tests.mq5` | Unit tests for Risk Governor | 1 |
 | `MQL5/Scripts/fp50k/SignalEngine_tests.mq5` | Unit tests for Signal Engine | 2 |
+| `MQL5/Scripts/fp50k/NewsFilter_tests.mq5` | Unit tests for News Filter | 3 |
 | `sync_to_mt5.sh` | Copies source into the Wine MT5 install | 1 |
 | `run_tests.sh` | Headless compile + test runner | 2 |
 
@@ -71,16 +72,26 @@ copy silently swallows the headless launch.
 ./run_tests.sh
 ```
 
-Runs every `*_tests.mq5`, compiling each first and failing the run on any
+Compiles `FP50K_EA.mq5`, then runs every `*_tests.mq5`, failing the run on any
 compile error, any warning, or any failed assertion. Pass a name to run one
 suite: `./run_tests.sh SignalEngine_tests`.
 
-Current state: **95 assertions, 0 failures.**
+The EA is only ever **compiled** by this script — never attached to a chart and
+never run. Attaching it is a deliberate manual step in the MetaTrader GUI.
+
+Current state: **140 assertions, 0 failures.**
 
 | Suite | Assertions |
 |-------|-----------|
+| `NewsFilter_tests` | 45 |
 | `RiskManager_tests` | 36 |
 | `SignalEngine_tests` | 59 |
+
+### What the tests do and do not prove
+
+They verify wiring and arithmetic: lot sizing, stop and target placement,
+blackout windows, gate refusals. They do **not** establish that the strategy is
+profitable — no historical backtest has been run yet. That is Sprint 4.
 
 ## Commit History
 
