@@ -34,6 +34,14 @@ input int      InpMaxSpreadGBP  = 25;      // Max spread GBPUSD (points)
 input bool     InpTradeEURUSD   = true;    // Enable EURUSD
 input bool     InpTradeGBPUSD   = true;    // Enable GBPUSD
 input ENTRY_MODE InpEntryMode   = ENTRY_MODE_SWEEP;  // Entry model (sweep-fade / legacy breakout)
+//--- Session windows, UTC hours. An end at or before the start crosses
+//    midnight. These are inputs, not constants, because WHICH hours the
+//    contraction and the fade happen in is an empirical question - and one this
+//    project's own clock defect already raised by accident.
+input int      InpAsianStartH   = 0;       // Contraction window start (UTC hour)
+input int      InpAsianEndH     = 7;       // Contraction window end (UTC hour, exclusive)
+input int      InpHuntStartH    = 7;       // Sweep hunt window start (UTC hour)
+input int      InpHuntEndH      = 17;      // Sweep hunt window end (UTC hour, exclusive)
 //--- Asian liquidity sweep & fade
 input double   InpSweepMinPips  = 3.0;     // Poke beyond the range that counts as a sweep (pips)
 input double   InpSweepSLBuffer = 2.0;     // Stop beyond the sweeping wick (pips)
@@ -322,12 +330,19 @@ int OnInit() {
 
   g_risk.SetNewsBlockMinutes(InpNewsBlockMin);
 
+  // The governor's gate and the engine's hunt window must be the same window.
+  // If they drift apart the EA finds setups and is then blocked from taking
+  // them, which looks like a strategy with no signals rather than a config bug.
+  g_risk.SetSessionWindow(InpHuntStartH, InpHuntEndH);
+
   if(InpTradeEURUSD) {
     if(!g_signal_eur.Init(SYM_EUR, InpRiskUSD, InpRRRatio)) return INIT_FAILED;
     g_signal_eur.SetMode(InpEntryMode);
     g_signal_eur.SetGeometry(InpStopRangeFrac, InpConsistentTP);
     g_signal_eur.SetSweepParams(InpSweepMinPips, InpSweepSLBuffer,
                                 InpRangeMinPips, InpRangeMaxPips, InpRangeAtrFrac);
+    g_signal_eur.SetSessionWindows(InpAsianStartH, InpAsianEndH,
+                                    InpHuntStartH, InpHuntEndH);
     g_signal_eur.SetExecution(InpSlippagePips);
     g_atr_eur = iATR(SYM_EUR, PERIOD_H1, 14);
     if(g_atr_eur == INVALID_HANDLE) {
@@ -341,6 +356,8 @@ int OnInit() {
     g_signal_gbp.SetGeometry(InpStopRangeFrac, InpConsistentTP);
     g_signal_gbp.SetSweepParams(InpSweepMinPips, InpSweepSLBuffer,
                                 InpRangeMinPips, InpRangeMaxPips, InpRangeAtrFrac);
+    g_signal_gbp.SetSessionWindows(InpAsianStartH, InpAsianEndH,
+                                    InpHuntStartH, InpHuntEndH);
     g_signal_gbp.SetExecution(InpSlippagePips);
     g_atr_gbp = iATR(SYM_GBP, PERIOD_H1, 14);
     if(g_atr_gbp == INVALID_HANDLE) {

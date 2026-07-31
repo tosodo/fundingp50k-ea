@@ -99,6 +99,10 @@ private:
   // guidance and the strategy's tolerance for a release are different numbers.
   int        m_news_block_min;
 
+  // Trading window in UTC hours. Mirrors the signal engine's hunt window.
+  int        m_session_open_hour;
+  int        m_session_close_hour;
+
   // Log file
   int        m_log_file;
   string     m_log_filename;
@@ -143,6 +147,27 @@ public:
     m_news_block_min = (minutes > 0) ? minutes : NEWS_BLOCK_MINUTES;
   }
   int    GetNewsBlockMinutes() { return m_news_block_min; }
+
+  //--- Trading window, UTC hours. Must track the signal engine's hunt window:
+  //    this gate refuses entries outside it, so a hunt window the governor does
+  //    not know about produces a strategy that finds setups and is blocked from
+  //    taking every one of them.
+  void   SetSessionWindow(int open_hour, int close_hour) {
+    if(open_hour < 0 || open_hour > 23 || close_hour < 0 || close_hour > 23) return;
+    if(open_hour == close_hour) return;
+    m_session_open_hour  = open_hour;
+    m_session_close_hour = close_hour;
+  }
+  int    SessionOpenHour()  { return m_session_open_hour; }
+  int    SessionCloseHour() { return m_session_close_hour; }
+
+  //--- Same wrap-aware test the signal engine uses, kept static so both agree
+  //    by construction rather than by two matching comments.
+  static bool HourInSession(int hour, int open_hour, int close_hour) {
+    if(open_hour == close_hour) return false;
+    if(open_hour < close_hour)  return (hour >= open_hour && hour < close_hour);
+    return (hour >= open_hour || hour < close_hour);
+  }
 
   // Pure helpers - no account access, so tests can drive them with known
   // numbers instead of needing a live balance the sandbox does not have.
@@ -262,6 +287,8 @@ CRiskManager::CRiskManager() {
   m_initial_balance = FP_INITIAL_BALANCE;
   m_overall_floor = EffectiveOverallFloor(FP_INITIAL_BALANCE, FP_OVERALL_DD_PCT);
   m_news_block_min = NEWS_BLOCK_MINUTES;
+  m_session_open_hour  = SESSION_OPEN_HOUR;
+  m_session_close_hour = SESSION_CLOSE_HOUR;
   m_log_file = INVALID_HANDLE;
   m_magic_number = 50001;
 }
@@ -415,7 +442,8 @@ bool CRiskManager::CanOpenTrade(double sl_pips, double risk_usd, string symbol, 
 
   // Layer 3: Session window
   if(!IsInsideSessionWindow()) {
-    block_reason = "Outside London session window (07:00-17:00 UTC)";
+    block_reason = StringFormat("Outside the trading window (%02d:00-%02d:00 UTC)",
+      m_session_open_hour, m_session_close_hour);
     LogDecision(symbol, block_reason, AccountInfoDouble(ACCOUNT_EQUITY), m_daily_loss_usd, true);
     return false;
   }
@@ -652,10 +680,7 @@ bool CRiskManager::IsInsideSessionWindow() {
   // Check day (1=Monday, 5=Friday)
   if(dt.day_of_week < 1 || dt.day_of_week > 5) return false;
 
-  // Check hour (7 to 16, since 17 is outside)
-  if(dt.hour < SESSION_OPEN_HOUR || dt.hour >= SESSION_CLOSE_HOUR) return false;
-
-  return true;
+  return HourInSession(dt.hour, m_session_open_hour, m_session_close_hour);
 }
 
 //--- IsFridayFlatten: Friday 20:00 UTC approaching?

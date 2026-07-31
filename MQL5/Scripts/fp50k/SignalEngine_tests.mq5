@@ -6,6 +6,7 @@
 #property script_show_inputs
 
 #include <fp50k\SignalEngine.mqh>
+#include <fp50k\RiskManager.mqh>
 
 int test_count  = 0;
 int test_passed = 0;
@@ -361,6 +362,70 @@ void OnStart()
    Check("Breakout mode still returns a decision", StringLen(ctrl.reason) > 0, ctrl.reason);
    engine.SetMode(ENTRY_MODE_SWEEP);
    Check("Entry modes are distinct values", (int)ENTRY_MODE_SWEEP != (int)ENTRY_MODE_BREAKOUT);
+
+//--- GROUP 18: Session windows, including the midnight wrap.
+//    The wrap is not a curiosity: a clock defect had this project accidentally
+//    measuring 21:00-04:00 UTC for months, and that window outperformed the
+//    00:00-07:00 one it was meant to use. Supporting it properly is what turns
+//    that accident into a hypothesis that can be tested on purpose.
+   Check("A normal window includes its start hour",
+         CSignalEngine::HourInWindow(7, 7, 17) == true);
+   Check("A normal window excludes its end hour",
+         CSignalEngine::HourInWindow(17, 7, 17) == false);
+   Check("A normal window includes the hour before the end",
+         CSignalEngine::HourInWindow(16, 7, 17) == true);
+   Check("A normal window excludes an earlier hour",
+         CSignalEngine::HourInWindow(6, 7, 17) == false);
+
+   Check("A wrapping window includes its start hour",
+         CSignalEngine::HourInWindow(21, 21, 4) == true);
+   Check("A wrapping window includes hours before midnight",
+         CSignalEngine::HourInWindow(23, 21, 4) == true);
+   Check("A wrapping window includes hours after midnight",
+         CSignalEngine::HourInWindow(2, 21, 4) == true);
+   Check("A wrapping window excludes its end hour",
+         CSignalEngine::HourInWindow(4, 21, 4) == false);
+   Check("A wrapping window excludes the middle of the day",
+         CSignalEngine::HourInWindow(12, 21, 4) == false);
+
+   Check("An empty window admits nothing rather than everything",
+         CSignalEngine::HourInWindow(12, 9, 9) == false,
+         "start == end must not be read as all-day");
+
+   Check("The governor and the engine agree on every hour",
+         CSignalEngine::HourInWindow(2,  21, 4) == CRiskManager::HourInSession(2,  21, 4) &&
+         CSignalEngine::HourInWindow(12, 21, 4) == CRiskManager::HourInSession(12, 21, 4) &&
+         CSignalEngine::HourInWindow(7,   7, 17) == CRiskManager::HourInSession(7,   7, 17) &&
+         CSignalEngine::HourInWindow(17,  7, 17) == CRiskManager::HourInSession(17,  7, 17),
+         "a gate that disagrees with the signal blocks every setup it finds");
+
+//--- Contraction window plumbing
+   CAsianRange win;
+   win.Init(_Symbol);
+   Check("Default contraction window is 00:00-07:00 UTC",
+         win.StartHour() == 0 && win.EndHour() == 7);
+   Check("The default window does not wrap", win.WrapsMidnight() == false);
+
+   win.SetWindow(21, 4);
+   Check("Contraction window is settable",
+         win.StartHour() == 21 && win.EndHour() == 4);
+   Check("A 21-04 window is detected as wrapping", win.WrapsMidnight() == true);
+
+   win.SetWindow(25, 4);
+   Check("An out-of-range hour is refused, not clamped",
+         win.StartHour() == 21 && win.EndHour() == 4,
+         "clamping a typo to hour 0 would measure a window nobody asked for");
+
+   engine.SetSessionWindows(22, 5, 5, 15);
+   Check("Hunt window is settable",
+         engine.HuntOpenHour() == 5 && engine.HuntCloseHour() == 15);
+   engine.SetSessionWindows(22, 5, 9, 9);
+   Check("An empty hunt window is refused",
+         engine.HuntOpenHour() == 5 && engine.HuntCloseHour() == 15,
+         "accepting it would disable the strategy silently");
+
+// Put the engine back before the live checks below.
+   engine.SetSessionWindows(0, 7, 7, 17);
 
 //--- GROUP 9: CheckSignal always returns a decision, never a half-filled struct
    SSignal live = engine.CheckSignal(_Symbol);

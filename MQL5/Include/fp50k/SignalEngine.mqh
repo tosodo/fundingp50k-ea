@@ -137,6 +137,12 @@ private:
   double      m_range_max_pips;
   double      m_range_atr_frac;
 
+  //--- Hunt window in UTC hours: when sweeps are looked for. Separate from the
+  //    contraction window, and settable for the same reason - which hours a
+  //    fade works in is a question the data answers, not a constant.
+  int         m_hunt_open_hour;
+  int         m_hunt_close_hour;
+
   //--- Assumed adverse fill, in pips. The Strategy Tester fills at the exact
   //    quote, which no live account ever does. Charging this against the
   //    geometry makes a backtest cost what a real fill costs.
@@ -167,6 +173,20 @@ public:
                          double range_min_pips, double range_max_pips,
                          double range_atr_frac);
   void    SetExecution(double slippage_pips);
+
+  //--- Contraction window (delegated to the range) and hunt window, UTC hours.
+  void    SetSessionWindows(int asian_start, int asian_end,
+                            int hunt_open, int hunt_close);
+  int     HuntOpenHour()  { return m_hunt_open_hour; }
+  int     HuntCloseHour() { return m_hunt_close_hour; }
+
+  //--- Pure window test, so the wrap-around case can be driven directly rather
+  //    than by waiting for the clock to reach the awkward hour.
+  static bool HourInWindow(int hour, int open_hour, int close_hour) {
+    if(open_hour == close_hour) return false;            // empty, not all-day
+    if(open_hour < close_hour)  return (hour >= open_hour && hour < close_hour);
+    return (hour >= open_hour || hour < close_hour);     // crosses midnight
+  }
 
   void    OnNewBar(string symbol);
   SSignal CheckSignal(string symbol);
@@ -268,6 +288,33 @@ CSignalEngine::CSignalEngine() {
   m_range_atr_frac  = SWEEP_ATR_FRACTION;
   m_slippage_pips   = 0.0;
   m_last_sweep_bar  = 0;
+  m_hunt_open_hour  = SIG_SESSION_OPEN_HOUR;
+  m_hunt_close_hour = SIG_SESSION_CLOSE_HOUR;
+}
+
+//--- SetSessionWindows: contraction window and hunt window, both UTC hours.
+void CSignalEngine::SetSessionWindows(int asian_start, int asian_end,
+                                      int hunt_open, int hunt_close) {
+  m_asian_range.SetWindow(asian_start, asian_end);
+
+  if(hunt_open < 0 || hunt_open > 23 || hunt_close < 0 || hunt_close > 23) {
+    Print("[SignalEngine] ERROR: hunt window ", hunt_open, "-", hunt_close,
+          " is outside 0-23. Keeping ", m_hunt_open_hour, "-", m_hunt_close_hour, ".");
+    return;
+  }
+  if(hunt_open == hunt_close) {
+    Print("[SignalEngine] ERROR: hunt window ", hunt_open, "-", hunt_close,
+          " is empty - that would disable the strategy silently. Keeping ",
+          m_hunt_open_hour, "-", m_hunt_close_hour, ".");
+    return;
+  }
+
+  m_hunt_open_hour  = hunt_open;
+  m_hunt_close_hour = hunt_close;
+
+  Print("[SignalEngine] Sessions ", m_symbol,
+        " | contraction ", asian_start, ":00-", asian_end, ":00 UTC",
+        " | hunt ", m_hunt_open_hour, ":00-", m_hunt_close_hour, ":00 UTC");
 }
 
 //--- Destructor
@@ -423,9 +470,8 @@ bool CSignalEngine::IsLondonSession() {
   TimeToStruct(FpNowUtc(), dt);
 
   if(dt.day_of_week < 1 || dt.day_of_week > 5) return false;
-  if(dt.hour < SIG_SESSION_OPEN_HOUR || dt.hour >= SIG_SESSION_CLOSE_HOUR) return false;
 
-  return true;
+  return HourInWindow(dt.hour, m_hunt_open_hour, m_hunt_close_hour);
 }
 
 //--- GetH4Trend: 1 = bullish, -1 = bearish, 0 = ambiguous.

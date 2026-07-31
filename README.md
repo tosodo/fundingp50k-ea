@@ -73,6 +73,23 @@ side of the break the EA takes.
 5. **Stop** — 2 pips beyond the sweeping candle's extreme wick.
 6. **Target** — a fixed 2.5× the stop distance, measured from the entry.
 
+### Session windows are inputs, not constants
+
+`InpAsianStartH` / `InpAsianEndH` set the contraction window and
+`InpHuntStartH` / `InpHuntEndH` the hours sweeps are looked for, all in UTC.
+An end at or before the start crosses midnight and is handled.
+
+They are inputs because *which* hours a fade works in is an empirical question,
+and this project's own clock defect raised it by accident: for months the EA was
+really measuring 21:00–04:00 UTC, and that window outperformed the 00:00–07:00
+one it was meant to use. Supporting the wrap properly is what turns that
+accident into a hypothesis testable on purpose.
+
+The risk governor's gate is set from the same values in `OnInit`. If the two
+drifted apart the EA would find setups and then be blocked from taking every
+one of them — which looks like a strategy with no signals rather than a
+misconfiguration.
+
 ### Legacy Asian Range Breakout (control, `InpEntryMode = 1`)
 
 The original entry, unchanged and still reachable. It is known to have no edge —

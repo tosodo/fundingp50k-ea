@@ -304,6 +304,69 @@ when it auto-detects 0h inside the tester.
 **This means the numbers above describe the right strategy measured over the
 wrong hours.** They are superseded by the corrected run below.
 
+### 2026-07-31 — session-window sweep (corrected clock)
+
+The one lead the data raised rather than a parameter someone wanted to turn.
+The bar was written into the sweep script **before** it ran:
+
+> A window passes only if **all three** hold: win rate ≥ 28.6% (break-even at
+> 2.5:1), EV per trade > $0, and max drawdown < 8%. Clearing one or two is not
+> passing. If none clear all three, the answer is no and the sweep stops — it
+> does not get widened until something passes.
+
+Six windows, all chosen up front. Management off throughout, so each is a clean
+measurement of the entry. Contraction and hunt windows in UTC; an end at or
+before the start crosses midnight.
+
+| Contraction → Hunt | Trades | Win % | PF | EV/trade | Max DD | Daily DD | Verdict |
+|---|---|---|---|---|---|---|---|
+| 00–07 → 07–17 *(intended)* | 131 | 26.0% | 0.92 | −$21.49 | 15.59% | 2.88% | fail |
+| 21–04 → 04–14 *(the accident)* | 161 | 26.7% | 0.98 | −$4.14 | 20.61% | 2.96% | fail |
+| 22–05 → 05–15 | 169 | 26.6% | 0.97 | −$7.54 | 22.14% | 2.98% | fail |
+| **23–06 → 06–16** | 226 | 27.4% | **1.01** | **+$2.98** | **28.34%** | 2.97% | **fail** |
+| 00–07 → 07–12 *(narrow)* | 91 | 25.3% | 0.90 | −$26.86 | 13.02% | 2.44% | fail |
+| 21–04 → 04–10 *(narrow)* | 121 | 25.6% | 0.95 | −$13.73 | 17.22% | 2.29% | fail |
+
+**Nothing passed. Per the stopping rule, the sweep ends here.**
+
+#### The window matters more than anything else tested
+
+EV moved from −$26.86 to +$2.98 across these six cells — a **$29.84 per trade**
+swing from nothing but *when* the EA is allowed to look. For comparison, twelve
+exit variants in the 2026-07-30 round moved the average loss by about $13, and
+the parameter that was supposed to matter most produced byte-identical output.
+
+That is the real finding of this round, and it is a finding about market
+structure rather than about tuning: the hours 23:00–06:00 UTC contain a
+contraction whose failed breaks revert, and 00:00–07:00 UTC does not, on 2025
+EURUSD. Worth knowing. Not yet worth trading.
+
+#### Why the one positive row is still a no
+
+23–06 → 06–16 is the first positive expectancy this project has produced. It
+fails anyway, and it should:
+
+- **Drawdown 28.34%** against an 8% bar. On $50,000 that is a $14,000 trough in
+  a challenge that ends at $5,000. It would not survive a fortnight.
+- **Win rate 27.4% is still below the 28.6% break-even.** Positive EV alongside
+  a sub-break-even hit rate means the profit is not coming from being right more
+  often — it comes from position size varying with stop distance, so a few
+  large-size winners carry the whole year. That is a fragile way to make money,
+  and it is the same mechanism producing the drawdown.
+- **Profit factor 1.01 is indistinguishable from 1.00.** One cell out of six, on
+  one year, on one pair.
+
+Selecting the best cell of six and calling it an edge is precisely the
+curve-fit the stopping rule exists to prevent. The rule was written down before
+the sweep for exactly this moment, when a tempting number appears.
+
+#### What would make this worth revisiting
+
+Not more window tuning. The honest next test, if this is ever picked up again,
+is whether the 23–06 result survives contact with data it was not selected on:
+a different year, and GBPUSD. If it holds on both, it is a hypothesis. If it
+does not, it was 2025 EURUSD noise and the six-cell sweep found it by looking.
+
 ### 2026-07-31 (later) — the same grid, with the clock actually correct
 
 Broker offset measured live against FundingPips-SIM1 as **+3h in July**, i.e. a
@@ -514,13 +577,20 @@ and one year of data, a passing configuration can always be found, and it would
 be fitted to 2025's noise. That stopping rule has now been invoked twice and
 holds here too.
 
-One genuinely open lead, and it is a lead about *hours*, not parameters. The
-buggy window (21:00–04:00 UTC) beat the intended one (00:00–07:00 UTC) on every
-measure — more setups, higher profit factor, a fifth of the loss per trade. The
-disciplined way to use that is a deliberate sweep of the session window as an
-input, on the corrected clock, with the same pre-agreed acceptance bar. That is
-testing a hypothesis the data raised, not tuning until something passes. It is
-also the only remaining idea here that is not already known to fail.
+That lead — the session window — **has now been swept, and it failed too.** Six
+windows, bar written down first, nothing cleared it. The best cell reached
+positive expectancy (+$2.98/trade, PF 1.01) with a 28.34% drawdown and a win
+rate still under break-even. Full table above.
+
+So all three levers this strategy has are now measured: the exits (no effect),
+the entry direction (fade beats breakout, both negative), and the session
+window (largest effect of the three, still no pass). There is no fourth lever
+left that is not tuning.
+
+**The decision is unchanged: no challenge purchase.** If this is picked up
+again, the single honest test is whether the 23–06 window survives a different
+year and GBPUSD — data it was not selected on. Everything else would be
+searching a six-cell grid for a number that flatters 2025.
 
 Independently of the outcome, the infrastructure is now worth more than the
 strategy: a risk governor with the firm's rules layered two ways, a validator

@@ -31,6 +31,12 @@ private:
   datetime m_range_date;   // UTC date the range was set (for daily reset)
   string   m_symbol;       // Symbol this instance tracks
 
+  // Window bounds in UTC hours. Settable because WHICH hours to treat as the
+  // contraction session is an empirical question, not a constant - and one the
+  // data has already raised. See SetWindow().
+  int      m_start_hour;
+  int      m_end_hour;
+
   double   PipSize(string symbol);
   datetime UtcDayStart();
   int      ServerUtcOffset();
@@ -39,6 +45,21 @@ public:
   CAsianRange();
 
   bool   Init(string symbol);
+
+  //--- Set the contraction window, in UTC hours, end exclusive.
+  //
+  //    An end at or before the start means the window CROSSES MIDNIGHT and is
+  //    read as [start on the previous day, end today). That case is not
+  //    hypothetical: a clock defect had this project measuring 21:00-04:00 UTC
+  //    by accident for months, and that window produced better numbers than the
+  //    00:00-07:00 one it was supposed to be using. Supporting the wrap is what
+  //    makes that testable deliberately rather than by accident.
+  void   SetWindow(int start_hour, int end_hour);
+
+  bool   WrapsMidnight() { return (m_end_hour <= m_start_hour); }
+  int    StartHour()     { return m_start_hour; }
+  int    EndHour()       { return m_end_hour; }
+
   void   Reset();
   void   OnNewBar(string symbol);
   void   CalculateRange(string symbol);
@@ -61,8 +82,30 @@ public:
 
 //--- Constructor
 CAsianRange::CAsianRange() {
-  m_symbol = "";
+  m_symbol     = "";
+  m_start_hour = ASIAN_START_HOUR;
+  m_end_hour   = ASIAN_END_HOUR;
   Reset();
+}
+
+//--- SetWindow: out-of-range hours are ignored rather than clamped. Silently
+//    turning a typo into hour 0 would produce a plausible-looking result for a
+//    window nobody asked for, which is the exact failure this project has
+//    already been bitten by twice.
+void CAsianRange::SetWindow(int start_hour, int end_hour) {
+  if(start_hour < 0 || start_hour > 23 || end_hour < 0 || end_hour > 23) {
+    Print("[AsianRange] ERROR: window ", start_hour, "-", end_hour,
+          " is outside 0-23. Keeping ", m_start_hour, "-", m_end_hour, ".");
+    return;
+  }
+
+  m_start_hour = start_hour;
+  m_end_hour   = end_hour;
+  Reset();
+
+  Print("[AsianRange] Window ", m_symbol, " = ",
+        m_start_hour, ":00-", m_end_hour, ":00 UTC",
+        (WrapsMidnight() ? " (crosses midnight)" : ""));
 }
 
 //--- Init: bind this instance to a symbol
@@ -122,8 +165,8 @@ void CAsianRange::OnNewBar(string symbol) {
   MqlDateTime gmt;
   TimeToStruct(FpNowUtc(), gmt);
 
-  // Once the Asian session has closed, measure it (once per day)
-  if(gmt.hour >= ASIAN_END_HOUR && !m_range_set) {
+  // Once the contraction session has closed, measure it (once per day)
+  if(gmt.hour >= m_end_hour && !m_range_set) {
     CalculateRange(symbol);
   }
 }
@@ -140,8 +183,14 @@ void CAsianRange::CalculateRange(string symbol) {
   datetime day_start = UtcDayStart();
 
   // Window boundaries converted into broker server time
-  datetime win_start = day_start + ASIAN_START_HOUR * 3600 + offset;
-  datetime win_end   = day_start + ASIAN_END_HOUR   * 3600 + offset;
+  datetime win_start = day_start + m_start_hour * 3600 + offset;
+  datetime win_end   = day_start + m_end_hour   * 3600 + offset;
+
+  // A window that crosses midnight starts on the PREVIOUS day. Without this the
+  // start would sit after the end, every bar would fail one test or the other,
+  // and the range would silently come back unset - a strategy that never trades
+  // rather than an error anyone would notice.
+  if(WrapsMidnight()) win_start -= 24 * 3600;
 
   double hi = 0.0, lo = 0.0;
   int    bars_found = 0;
@@ -171,7 +220,8 @@ void CAsianRange::CalculateRange(string symbol) {
   }
 
   if(bars_found == 0) {
-    Print("[AsianRange] ", symbol, ": no H1 bars found in 00:00-07:00 UTC window - range unset");
+    Print("[AsianRange] ", symbol, ": no H1 bars found in ",
+          m_start_hour, ":00-", m_end_hour, ":00 UTC window - range unset");
     return;
   }
 
