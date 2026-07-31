@@ -17,6 +17,10 @@
 #define MAX_RANGE_PIPS     80   // Ignore gap/spike days - stop would be too wide
 #define RETEST_TOLERANCE   3    // How close price must hold to the broken level
 
+//--- Broker clock / UTC reconciliation. Shared with RiskManager and
+//    SignalEngine, so it lives in its own header rather than here.
+#include "Clock.mqh"
+
 class CAsianRange {
 private:
   double   m_high;         // Asian session highest high
@@ -92,13 +96,13 @@ double CAsianRange::PipSize(string symbol) {
 //    Bar timestamps come back in server time but the Asian session is defined
 //    in UTC, so the two must be reconciled before any hour comparison.
 int CAsianRange::ServerUtcOffset() {
-  return (int)(TimeCurrent() - TimeGMT());
+  return FpUtcOffsetSecs();
 }
 
 //--- UtcDayStart: today's 00:00 UTC
 datetime CAsianRange::UtcDayStart() {
   MqlDateTime gmt;
-  TimeToStruct(TimeGMT(), gmt);
+  TimeToStruct(FpNowUtc(), gmt);
   gmt.hour = 0;
   gmt.min  = 0;
   gmt.sec  = 0;
@@ -116,7 +120,7 @@ void CAsianRange::OnNewBar(string symbol) {
   }
 
   MqlDateTime gmt;
-  TimeToStruct(TimeGMT(), gmt);
+  TimeToStruct(FpNowUtc(), gmt);
 
   // Once the Asian session has closed, measure it (once per day)
   if(gmt.hour >= ASIAN_END_HOUR && !m_range_set) {

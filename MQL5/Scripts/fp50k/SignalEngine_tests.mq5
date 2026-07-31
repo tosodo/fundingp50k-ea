@@ -196,6 +196,172 @@ void OnStart()
          bad_pip.sl_pips == 0.0 && bad_quote.sl_pips == 0.0 &&
          inverted.sl_pips == 0.0 && crossed.sl_pips == 0.0);
 
+//--- GROUP 10: Sweep & fade constants
+   Check("SWEEP_MIN_PIPS == 3",        SWEEP_MIN_PIPS       == 3.0);
+   Check("SWEEP_SL_BUFFER_PIPS == 2",  SWEEP_SL_BUFFER_PIPS == 2.0);
+   Check("SWEEP_MIN_RANGE_PIPS == 8",  SWEEP_MIN_RANGE_PIPS == 8.0);
+   Check("SWEEP_MAX_RANGE_PIPS == 40", SWEEP_MAX_RANGE_PIPS == 40.0);
+   Check("SWEEP_ATR_FRACTION == 0.60", MathAbs(SWEEP_ATR_FRACTION - 0.60) < 1e-9);
+   Check("H4_EMA_PERIOD == 50",        H4_EMA_PERIOD        == 50);
+   Check("Sweep trigger runs on M5",   SWEEP_TIMEFRAME      == PERIOD_M5);
+   Check("The coiling band caps range width well below the breakout filter",
+         SWEEP_MAX_RANGE_PIPS < MAX_RANGE_PIPS,
+         "40 pips vs 80 - a fade needs a compressed range, a breakout did not");
+   Check("The coiling band is a real band, not an open end",
+         SWEEP_MIN_RANGE_PIPS > 0.0 && SWEEP_MIN_RANGE_PIPS < SWEEP_MAX_RANGE_PIPS);
+
+// The sweep model applies its OWN 8-pip floor, which sits below the legacy
+// 10-pip one. That is why CheckSweepSignal gates on IsRangeSet() rather than
+// IsRangeValid() - routing it through the old validity flag would silently
+// discard every 8-9 pip range the new filter was written to accept.
+   Check("The sweep floor is deliberately below the legacy range filter",
+         SWEEP_MIN_RANGE_PIPS < MIN_RANGE_PIPS,
+         "8 vs 10 pips - the sweep path must not inherit the old flag");
+
+//--- GROUP 11: Sweep detection. Range 1.0950-1.1000, pip 0.0001, min sweep 3p.
+//    The two halves of the rule are independent, and a test that only proves
+//    one of them would pass while the EA traded exactly the wrong direction.
+   Check("A 5-pip poke above the high that closes back inside is a sell sweep",
+         CSignalEngine::IsSweepAbove(1.1005, 1.0990, hi, pip, 3.0) == true);
+   Check("A 3-pip poke exactly meets the threshold",
+         CSignalEngine::IsSweepAbove(1.1003, 1.0990, hi, pip, 3.0) == true);
+   Check("A 2-pip graze is not a sweep",
+         CSignalEngine::IsSweepAbove(1.1002, 1.0990, hi, pip, 3.0) == false,
+         "inside the spread, so it means nothing");
+   Check("A poke that CLOSES outside is a breakout, not a sweep",
+         CSignalEngine::IsSweepAbove(1.1010, 1.1008, hi, pip, 3.0) == false,
+         "this is the trade the old strategy took, and it lost");
+   Check("A bar that never reaches the high is not a sweep",
+         CSignalEngine::IsSweepAbove(1.0995, 1.0980, hi, pip, 3.0) == false);
+   Check("A close exactly at the high does not count as back inside",
+         CSignalEngine::IsSweepAbove(1.1005, hi, hi, pip, 3.0) == false);
+
+   Check("A 5-pip poke below the low that closes back inside is a buy sweep",
+         CSignalEngine::IsSweepBelow(1.0945, 1.0960, lo, pip, 3.0) == true);
+   Check("A 2-pip graze below is not a sweep",
+         CSignalEngine::IsSweepBelow(1.0948, 1.0960, lo, pip, 3.0) == false);
+   Check("A poke below that closes below is a breakdown, not a sweep",
+         CSignalEngine::IsSweepBelow(1.0940, 1.0942, lo, pip, 3.0) == false);
+   Check("Zero pip size refuses both directions rather than dividing by zero",
+         CSignalEngine::IsSweepAbove(1.1005, 1.0990, hi, 0.0, 3.0) == false &&
+         CSignalEngine::IsSweepBelow(1.0945, 1.0960, lo, 0.0, 3.0) == false);
+
+//--- GROUP 12: Volatility coiling filter
+   Check("A 20-pip range inside a 60-pip ATR day is tradeable",
+         CSignalEngine::RangeVolatilityOk(20.0, 60.0, 8.0, 40.0, 0.60) == true);
+   Check("A 5-pip range is too quiet to fade",
+         CSignalEngine::RangeVolatilityOk(5.0, 60.0, 8.0, 40.0, 0.60) == false);
+   Check("A 50-pip range is too wide - a trend is already running",
+         CSignalEngine::RangeVolatilityOk(50.0, 120.0, 8.0, 40.0, 0.60) == false);
+   Check("A 38-pip range against a 50-pip ATR fails the ratio test",
+         CSignalEngine::RangeVolatilityOk(38.0, 50.0, 8.0, 40.0, 0.60) == false,
+         "38 is under the 40-pip cap but is 76% of the day's ATR, not 60%");
+   Check("The ratio test is skipped when the daily ATR is unavailable",
+         CSignalEngine::RangeVolatilityOk(38.0, 0.0, 8.0, 40.0, 0.60) == true,
+         "a missing filter must not silently reject every setup");
+   Check("An ATR fraction of zero switches the ratio test off",
+         CSignalEngine::RangeVolatilityOk(38.0, 50.0, 8.0, 40.0, 0.0) == true);
+   Check("The band boundaries are inclusive",
+         CSignalEngine::RangeVolatilityOk(8.0,  0.0, 8.0, 40.0, 0.0) == true &&
+         CSignalEngine::RangeVolatilityOk(40.0, 0.0, 8.0, 40.0, 0.0) == true);
+
+//--- GROUP 13: Sweep geometry. Sell setup - the bar swept to 1.1006 and closed
+//    back at 1.0990. Stop goes 2 pips above the wick; target is 2.5x the stop.
+   double sw_hi = 1.1006;
+   double sw_lo = 1.0988;
+
+   SSignal fade_s = engine.BuildSweepSignal(_Symbol, false, sw_hi, sw_lo,
+                                            1.0991, 1.0990, pip, 2.5, 2.0, 0.0);
+   Check("Sell fade is valid", fade_s.valid == true, fade_s.reason);
+   Check("Sell fade entry is the bid", MathAbs(fade_s.entry_price - 1.0990) < 1e-8);
+   Check("Sell fade stop sits 2 pips above the swept wick",
+         MathAbs(fade_s.stop_loss - (sw_hi + 2.0 * pip)) < 1e-8,
+         DoubleToString(fade_s.stop_loss, 5));
+   Check("Sell fade target is below the entry", fade_s.take_profit < fade_s.entry_price);
+   Check("Sell fade delivers exactly 2.5:1 measured from the entry",
+         MathAbs((fade_s.entry_price - fade_s.take_profit) /
+                 (fade_s.stop_loss - fade_s.entry_price) - 2.5) < 0.001,
+         "the old range-measured target quietly paid 1.79:1 on a nominal 2.0");
+   Check("Sell fade sl_pips matches the stop distance",
+         MathAbs(fade_s.sl_pips - (fade_s.stop_loss - fade_s.entry_price) / pip) < 0.001,
+         StringFormat("%.1f pips", fade_s.sl_pips));
+
+   SSignal fade_l = engine.BuildSweepSignal(_Symbol, true, 1.0962, 1.0944,
+                                            1.0960, 1.0959, pip, 2.5, 2.0, 0.0);
+   Check("Buy fade is valid", fade_l.valid == true, fade_l.reason);
+   Check("Buy fade entry is the ask", MathAbs(fade_l.entry_price - 1.0960) < 1e-8);
+   Check("Buy fade stop sits 2 pips below the swept wick",
+         MathAbs(fade_l.stop_loss - (1.0944 - 2.0 * pip)) < 1e-8);
+   Check("Buy fade delivers exactly 2.5:1",
+         MathAbs((fade_l.take_profit - fade_l.entry_price) /
+                 (fade_l.entry_price - fade_l.stop_loss) - 2.5) < 0.001);
+
+//--- GROUP 14: The slippage penalty must actually cost something.
+//    Charging it has to move the fill AGAINST us - a "penalty" that leaves the
+//    trade unchanged, or improves it, is worse than none at all because it
+//    looks like realism in the report.
+   SSignal slip_s = engine.BuildSweepSignal(_Symbol, false, sw_hi, sw_lo,
+                                            1.0991, 1.0990, pip, 2.5, 2.0, 0.5);
+   Check("Slippage fills a sell below the bid",
+         slip_s.entry_price < fade_s.entry_price,
+         StringFormat("%.5f vs %.5f", slip_s.entry_price, fade_s.entry_price));
+   Check("Slippage leaves a sell with a WIDER stop to survive",
+         slip_s.sl_pips > fade_s.sl_pips,
+         StringFormat("%.1f vs %.1f pips", slip_s.sl_pips, fade_s.sl_pips));
+
+   SSignal slip_l = engine.BuildSweepSignal(_Symbol, true, 1.0962, 1.0944,
+                                            1.0960, 1.0959, pip, 2.5, 2.0, 0.5);
+   Check("Slippage fills a buy above the ask",
+         slip_l.entry_price > fade_l.entry_price);
+   Check("Slippage leaves a buy with a wider stop too",
+         slip_l.sl_pips > fade_l.sl_pips);
+   Check("Slippage never flatters the R:R - it stays at 2.5:1 on a worse entry",
+         MathAbs((slip_l.take_profit - slip_l.entry_price) /
+                 (slip_l.entry_price - slip_l.stop_loss) - 2.5) < 0.001);
+
+//--- GROUP 15: Sweep geometry rejects nonsense rather than emitting a bad order
+   SSignal sw_bad_pip = engine.BuildSweepSignal(_Symbol, false, sw_hi, sw_lo,
+                                                1.0991, 1.0990, 0.0, 2.5, 2.0, 0.0);
+   Check("Sweep geometry rejects zero pip size", sw_bad_pip.valid == false);
+
+   SSignal sw_no_quote = engine.BuildSweepSignal(_Symbol, false, sw_hi, sw_lo,
+                                                 0.0, 0.0, pip, 2.5, 2.0, 0.0);
+   Check("Sweep geometry rejects a missing quote", sw_no_quote.valid == false);
+
+   SSignal sw_inverted = engine.BuildSweepSignal(_Symbol, false, sw_lo, sw_hi,
+                                                 1.0991, 1.0990, pip, 2.5, 2.0, 0.0);
+   Check("Sweep geometry rejects an inverted candle", sw_inverted.valid == false);
+
+   SSignal sw_bad_rr = engine.BuildSweepSignal(_Symbol, false, sw_hi, sw_lo,
+                                               1.0991, 1.0990, pip, 0.0, 2.0, 0.0);
+   Check("Sweep geometry rejects a zero reward ratio", sw_bad_rr.valid == false);
+
+// A sell whose bid is already ABOVE the stop leaves the stop on the wrong side.
+   SSignal sw_crossed = engine.BuildSweepSignal(_Symbol, false, sw_hi, sw_lo,
+                                                1.1050, 1.1049, pip, 2.5, 2.0, 0.0);
+   Check("Sweep geometry rejects a crossed stop distance", sw_crossed.valid == false,
+         sw_crossed.reason);
+
+   Check("Rejected sweeps never carry a positive stop distance",
+         sw_bad_pip.sl_pips == 0.0 && sw_no_quote.sl_pips == 0.0 &&
+         sw_inverted.sl_pips == 0.0 && sw_bad_rr.sl_pips == 0.0 &&
+         sw_crossed.sl_pips == 0.0);
+
+//--- GROUP 16: H4 bias must always answer with one of three defined states
+   int bias = engine.GetH4Bias(_Symbol);
+   Check("H4 bias is bull, bear or ambiguous",
+         bias == TREND_BULL || bias == TREND_BEAR || bias == TREND_AMBIGUOUS,
+         IntegerToString(bias));
+   Info("H4 bias now", bias == TREND_BULL ? "BULL" : (bias == TREND_BEAR ? "BEAR" : "AMBIGUOUS"));
+
+//--- GROUP 17: Mode switching. The breakout is retained as the control, so it
+//    must still be reachable and must still behave as it did.
+   engine.SetMode(ENTRY_MODE_BREAKOUT);
+   SSignal ctrl = engine.CheckSignal(_Symbol);
+   Check("Breakout mode still returns a decision", StringLen(ctrl.reason) > 0, ctrl.reason);
+   engine.SetMode(ENTRY_MODE_SWEEP);
+   Check("Entry modes are distinct values", (int)ENTRY_MODE_SWEEP != (int)ENTRY_MODE_BREAKOUT);
+
 //--- GROUP 9: CheckSignal always returns a decision, never a half-filled struct
    SSignal live = engine.CheckSignal(_Symbol);
    Check("CheckSignal returns a reason", StringLen(live.reason) > 0, live.reason);

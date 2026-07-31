@@ -17,7 +17,19 @@
 #
 #           Overridable by environment variable:
 #             BT_SYMBOL BT_PERIOD BT_FROM BT_TO BT_MODEL BT_DEPOSIT
-#             BT_LEVERAGE BT_WAIT_SECS
+#             BT_LEVERAGE BT_WAIT_SECS BT_SPREAD BT_EXEC_DELAY
+#
+# Realism  : The Strategy Tester will happily hand back results no live account
+#           could reproduce. Three costs are forced on every run here rather
+#           than left to the tester's defaults:
+#             1. Spread  - fixed at BT_SPREAD points (default 15 = 1.5 pips),
+#                          not the broker's optimistic current spread.
+#             2. Latency - BT_EXEC_DELAY ms between decision and fill.
+#             3. Slippage- charged inside the EA itself (InpSlippagePips), so
+#                          the stop lands nearer and the target further than
+#                          the quote implies. The tester has no slippage
+#                          setting, so this is the only place it can live.
+#           A run that only passes with these switched off has not passed.
 #
 # Notes   : MetaTrader is single-instance. A running terminal64.exe silently
 #           absorbs the /config: launch below, so the script refuses to start
@@ -48,6 +60,17 @@ MODEL="${BT_MODEL:-$DEF_MODEL}"
 DEPOSIT="${BT_DEPOSIT:-50000}"
 LEVERAGE="${BT_LEVERAGE:-100}"
 WAIT_SECS="${BT_WAIT_SECS:-$DEF_WAIT}"
+
+# Spread in POINTS, not pips: 15 points = 1.5 pips on a 5-digit pair. This is
+# the top of the 1.2-1.5 pip band the London open actually costs, applied to the
+# whole run. The tester cannot vary spread by hour, so the choice is between a
+# penalty that is always on and one that is never on - and only one of those two
+# errs in the safe direction.
+SPREAD="${BT_SPREAD:-15}"
+
+# Milliseconds between the EA deciding and the order filling. 0 is the tester's
+# default and is a fiction - nothing fills instantly.
+EXEC_DELAY="${BT_EXEC_DELAY:-0}"
 
 STAMP="$(date +%Y%m%d_%H%M%S)"
 REPORT_NAME="fp50k_report_${PROFILE}_${STAMP}"
@@ -103,7 +126,8 @@ ForwardMode=0
 Deposit=$DEPOSIT
 Currency=USD
 Leverage=1:$LEVERAGE
-ExecutionMode=0
+Spread=$SPREAD
+ExecutionMode=$EXEC_DELAY
 Optimization=0
 Visual=0
 Report=$REPORT_NAME
@@ -111,16 +135,69 @@ ReplaceReport=1
 ShutdownTerminal=1
 EOF
 
-# EA inputs. Anything not listed here keeps the default compiled into the EA.
-# BT_INPUTS is a semicolon-separated list, e.g.
-#   BT_INPUTS="InpAtrTrailMult=2.0;InpPartialPct=25" ./run_backtest.sh smoke
-if [ -n "${BT_INPUTS:-}" ]; then
-    echo "" >> "$INI_PATH"
-    echo "[TesterInputs]" >> "$INI_PATH"
-    echo "$BT_INPUTS" | tr ';' '\n' | while IFS= read -r kv; do
-        [ -n "$kv" ] && echo "$kv" >> "$INI_PATH"
-    done
-fi
+#--- EA inputs ----------------------------------------------------------------
+# EVERY input is written out explicitly, every run. This is not tidiness.
+#
+# An input left out of [TesterInputs] does NOT fall back to the value compiled
+# into the EA - MT5 reuses whatever that input was set to the last time the
+# Strategy Tester ran. That cost real time on 2026-07-31: InpRRRatio was changed
+# from 2.0 to 2.5 in the source, a run that omitted it silently executed at 2.0,
+# and the result was written up as a 2.5:1 measurement. Two runs that differ
+# only in a value you did not set will agree with each other and disagree with
+# the code, which is the worst possible failure mode for a backtest - it looks
+# like evidence.
+#
+# So: this list is the single source of truth for a run's settings. Keep it in
+# step with the EA's input block. BT_INPUTS overrides any line here.
+#
+# InpUtcOffsetH is pinned because the tester CANNOT work it out: TimeGMT()
+# mirrors the server clock there, auto-detection returns 0, and every UTC
+# session window silently becomes a server-time one. Measured live against
+# FundingPips-SIM1 on 2026-07-31 as +3h in July, i.e. a winter baseline of 2
+# with European summer time on top.
+BASE_INPUTS="\
+InpUtcOffsetH=2;\
+InpBrokerEuDst=true;\
+InpRiskUSD=375.0;\
+InpRRRatio=2.5;\
+InpMaxSpreadEUR=20;\
+InpMaxSpreadGBP=25;\
+InpTradeEURUSD=true;\
+InpTradeGBPUSD=true;\
+InpEntryMode=0;\
+InpSweepMinPips=3.0;\
+InpSweepSLBuffer=2.0;\
+InpRangeMinPips=8.0;\
+InpRangeMaxPips=40.0;\
+InpRangeAtrFrac=0.60;\
+InpMaxTradesDay=2;\
+InpSlippagePips=0.5;\
+InpUseLimitEntry=false;\
+InpLimitExpiryMin=60;\
+InpStopRangeFrac=0.0;\
+InpConsistentTP=false;\
+InpUsePartial=true;\
+InpUseBreakeven=true;\
+InpUseTrail=true;\
+InpPartialPct=50.0;\
+InpAtrTrailMult=0.5;\
+InpNewsBlockMin=15;\
+InpNewsCloseMin=15;\
+InpEntryOffsetMs=100;\
+InpMagicNumber=50001"
+
+# Merge: BASE_INPUTS first, then BT_INPUTS overriding by key. Last value for a
+# key wins, and each key is emitted exactly once.
+{
+    echo ""
+    echo "[TesterInputs]"
+    printf '%s\n%s\n' "$BASE_INPUTS" "${BT_INPUTS:-}" \
+        | tr ';' '\n' \
+        | grep -E '^[A-Za-z_][A-Za-z0-9_]*=' \
+        | awk -F= '{ order[$1] = (order[$1] ? order[$1] : ++n); val[$1] = substr($0, index($0, "=") + 1) }
+                   END { for (k in val) printf "%d\t%s=%s\n", order[k], k, val[k] }' \
+        | sort -n | cut -f2-
+} >> "$INI_PATH"
 
 MODEL_NAME="1 minute OHLC"
 [ "$MODEL" = "4" ] && MODEL_NAME="every tick based on real ticks"
@@ -133,6 +210,8 @@ echo "  Symbol   : $SYMBOL $PERIOD"
 echo "  Period   : $FROM -> $TO"
 echo "  Modelling: $MODEL_NAME"
 echo "  Deposit  : \$$DEPOSIT   Leverage 1:$LEVERAGE"
+echo "  Spread   : $SPREAD points forced (broker's own spread ignored)"
+echo "  Exec lag : ${EXEC_DELAY}ms"
 echo "  Timeout  : ${WAIT_SECS}s"
 [ -n "${BT_INPUTS:-}" ] && echo "  Inputs   : $BT_INPUTS"
 echo "--------------------------------------------------------------"
@@ -195,10 +274,40 @@ fi
 echo "=============================================================="
 echo "  VALIDATOR SUMMARY"
 echo "=============================================================="
+NEWS_OK=0
 if [ -f "$SUMMARY_FILE" ]; then
     cat "$SUMMARY_FILE"
+    NEWS_COUNT=$(grep -E "News blackouts observed" "$SUMMARY_FILE" \
+                 | grep -oE '[0-9]+$' | head -1)
+    [ -n "${NEWS_COUNT:-}" ] && [ "$NEWS_COUNT" -gt 0 ] && NEWS_OK=1
 else
     echo "(no summary file written — see the tester log below)"
+fi
+
+#--- News filter verification -------------------------------------------------
+# The news filter is the one safety control a backtest can silently fail to
+# exercise. If the tester has no calendar database, IsBlackedOut() returns false
+# every time, the EA trades straight through every release, and the run comes
+# back looking BETTER than reality rather than worse. That failure mode is
+# invisible unless something explicitly looks for it — so this does.
+echo "=============================================================="
+echo "  NEWS FILTER VERIFICATION"
+echo "=============================================================="
+if [ "$NEWS_OK" -eq 1 ]; then
+    echo "PASS: the news filter fired ${NEWS_COUNT} time(s) during this run."
+    echo "      Entries were blocked around high-impact releases as designed."
+else
+    echo "NOT VERIFIED: zero news blackouts were observed."
+    echo ""
+    echo "  Over a year of data there are hundreds of high-impact releases, so"
+    echo "  zero almost certainly means the Strategy Tester had no economic"
+    echo "  calendar data — not that no event ever landed in a trading window."
+    echo ""
+    echo "  This makes the run OPTIMISTIC: it never paid the cost of trading"
+    echo "  into a release. Treat the numbers as a ceiling, not a result."
+    echo ""
+    echo "  Fix: open MetaTrader 5, show the Calendar tab and let it populate,"
+    echo "       quit the terminal, then re-run."
 fi
 
 echo "=============================================================="

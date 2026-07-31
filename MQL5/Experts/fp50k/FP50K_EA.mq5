@@ -24,15 +24,29 @@
 #include <fp50k\NewsFilter.mqh>
 #include <fp50k\BacktestValidator.mqh>
 
-//--- Risk
-input double   InpRiskUSD       = 500.0;   // Risk per trade (USD)
-input double   InpRRRatio       = 2.0;     // R:R ratio target
+//--- Risk. InpRiskUSD is now a CEILING, not the size actually used: the risk
+//    manager sizes from live equity so the position shrinks with the account.
+input double   InpRiskUSD       = 375.0;   // Risk ceiling per trade (USD)
+input double   InpRRRatio       = 2.5;     // R:R ratio target
 input int      InpMaxSpreadEUR  = 20;      // Max spread EURUSD (points)
 input int      InpMaxSpreadGBP  = 25;      // Max spread GBPUSD (points)
 //--- Strategy
 input bool     InpTradeEURUSD   = true;    // Enable EURUSD
 input bool     InpTradeGBPUSD   = true;    // Enable GBPUSD
-//--- Entry geometry. Both defaults reproduce the original behaviour exactly.
+input ENTRY_MODE InpEntryMode   = ENTRY_MODE_SWEEP;  // Entry model (sweep-fade / legacy breakout)
+//--- Asian liquidity sweep & fade
+input double   InpSweepMinPips  = 3.0;     // Poke beyond the range that counts as a sweep (pips)
+input double   InpSweepSLBuffer = 2.0;     // Stop beyond the sweeping wick (pips)
+input double   InpRangeMinPips  = 8.0;     // Minimum Asian range (pips)
+input double   InpRangeMaxPips  = 40.0;    // Maximum Asian range (pips)
+input double   InpRangeAtrFrac  = 0.60;    // Max range as a fraction of D1 ATR(14), 0=off
+input int      InpMaxTradesDay  = 2;       // Max entries per symbol per day (0=unlimited)
+//--- Execution realism. Charged against the geometry of every entry, so a
+//    backtest cannot flatter itself with fills no live account would get.
+input double   InpSlippagePips  = 0.5;     // Assumed adverse fill (pips)
+input bool     InpUseLimitEntry = false;   // Place a limit at the swept edge instead of market
+input int      InpLimitExpiryMin= 60;      // Pending-order lifetime (minutes)
+//--- Legacy breakout geometry. Only read when InpEntryMode = BREAKOUT.
 input double   InpStopRangeFrac = 0.0;     // Stop distance as x range width (0=far side of range)
 input bool     InpConsistentTP  = false;   // Measure target from entry (true) or range (false)
 //--- Trade management. Each stage can be switched off independently, which is
@@ -42,7 +56,19 @@ input bool     InpUseBreakeven  = true;    // Move stop to breakeven at 1R
 input bool     InpUseTrail      = true;    // Trail the stop after 1R
 input double   InpPartialPct    = 50.0;    // Partial close at 1R (% of position)
 input double   InpAtrTrailMult  = 0.5;     // ATR multiple for trailing stop
-input int      InpNewsCloseMin  = 3;       // Close open trades N min before news
+//--- News. The blackout is symmetric: entries are blocked for this many
+//    minutes either side of a high-impact release.
+input int      InpNewsBlockMin  = 15;      // Block new entries +/- N min around news
+input int      InpNewsCloseMin  = 15;      // Close open trades N min before news
+//--- Clock. Every session boundary in this EA is written in UTC, but the broker
+//    stamps bars in server time. Live, the gap is auto-detected. In the Strategy
+//    Tester TimeGMT() mirrors the server clock, so auto-detection returns zero
+//    and the session windows silently shift by the broker's offset - set this
+//    to the server's real UTC offset in hours for any backtest.
+//    Measured on FundingPips-SIM1, 2026-07-31: +3h in summer, so the WINTER
+//    baseline is 2 with EU summer time applied on top.
+input int      InpUtcOffsetH    = FP_UTC_OFFSET_AUTO;  // Broker UTC offset in WINTER, hours (-9999=auto)
+input bool     InpBrokerEuDst   = true;    // Add 1h through European summer time
 //--- Execution
 input int      InpEntryOffsetMs = 100;     // Entry time offset ms (0=disable)
 input int      InpMagicNumber   = 50001;   // EA magic number
@@ -71,8 +97,48 @@ int g_atr_gbp = INVALID_HANDLE;
 //--- Tickets whose 1R partial close has already been taken
 ulong g_partial_done[];
 
+//--- Entries taken today, per symbol. A fade signal can re-arm several times
+//    in one London morning; without a ceiling the EA takes the same losing
+//    idea four times before lunch and calls it four independent trades.
+//    Keyed on the server-time day, which is the day the firm's limits use.
+long g_trade_day     = 0;
+int  g_trades_eur    = 0;
+int  g_trades_gbp    = 0;
+
 #define SYM_EUR "EURUSD"
 #define SYM_GBP "GBPUSD"
+
+//--- Roll the per-symbol daily counters when the server date changes.
+void RollTradeDay() {
+  long today = (long)TimeCurrent() / 86400;
+  if(today == g_trade_day) return;
+  g_trade_day  = today;
+  g_trades_eur = 0;
+  g_trades_gbp = 0;
+}
+
+int TradesTodayFor(string symbol) {
+  return (symbol == SYM_GBP) ? g_trades_gbp : g_trades_eur;
+}
+
+void CountTradeFor(string symbol) {
+  if(symbol == SYM_GBP) g_trades_gbp++;
+  else                  g_trades_eur++;
+}
+
+//--- A pending limit occupies the symbol just as a position does. Without this
+//    check the EA stacks a new limit on every qualifying bar while the first
+//    is still waiting.
+bool HasPendingOrder(string symbol) {
+  for(int i = OrdersTotal() - 1; i >= 0; i--) {
+    ulong ticket = OrderGetTicket(i);
+    if(ticket == 0) continue;
+    if(OrderGetString(ORDER_SYMBOL) != symbol) continue;
+    if((int)OrderGetInteger(ORDER_MAGIC) != InpMagicNumber) continue;
+    return true;
+  }
+  return false;
+}
 
 //+------------------------------------------------------------------+
 //| Partial-close bookkeeping                                        |
@@ -217,9 +283,52 @@ int OnInit() {
     return INIT_FAILED;
   }
 
+  // Clock diagnostic. The Asian range is defined in UTC but bar timestamps
+  // arrive in broker server time, so everything downstream depends on the gap
+  // between the two being reported honestly. Inside the Strategy Tester that
+  // is not guaranteed: if TimeGMT() simply mirrors the server clock, the
+  // offset computes as zero, the 00:00-07:00 "UTC" window is really
+  // 00:00-07:00 SERVER time, and on a GMT+3 broker the EA has been measuring
+  // 21:00-04:00 UTC - a different session entirely, with results to match.
+  // Printing it means the assumption is visible in every run's log instead of
+  // being taken on trust.
+  if(InpUtcOffsetH != FP_UTC_OFFSET_AUTO) {
+    FpSetUtcOffsetHours(InpUtcOffsetH);
+    FpSetBrokerEuDst(InpBrokerEuDst);
+  }
+
+  bool in_tester      = (MQLInfoInteger(MQL_TESTER) != 0);
+  int  detected_h     = (int)(TimeCurrent() - TimeGMT()) / 3600;
+  int  clock_offset_h = FpUtcOffsetSecs() / 3600;
+
+  Print("[FP50K] CLOCK | server=", TimeToString(TimeCurrent(), TIME_DATE | TIME_SECONDS),
+        " gmt=", TimeToString(TimeGMT(), TIME_DATE | TIME_SECONDS),
+        " detected=", detected_h, "h",
+        " applied=", clock_offset_h, "h",
+        (InpUtcOffsetH != FP_UTC_OFFSET_AUTO ? " (override)" : " (auto)"),
+        " | asian 00:00-07:00 UTC = ",
+        (24 + clock_offset_h) % 24, ":00-", (7 + clock_offset_h) % 24, ":00 server",
+        (in_tester ? " | TESTER" : " | LIVE"));
+
+  // A zero offset inside the tester is the signature of TimeGMT() mirroring the
+  // server clock, not of a genuinely UTC broker. Saying so is the whole point:
+  // this failure is silent, and a silent wrong session produces confident
+  // numbers about hours the strategy was never meant to trade.
+  if(in_tester && clock_offset_h == 0 && InpUtcOffsetH == FP_UTC_OFFSET_AUTO)
+    Print("[FP50K] WARNING: tester clock offset auto-detected as 0h. If this ",
+          "broker's server is not actually UTC, every session window in this ",
+          "run is shifted and the results describe different hours than the ",
+          "code claims. Set InpUtcOffsetH to the server's real UTC offset.");
+
+  g_risk.SetNewsBlockMinutes(InpNewsBlockMin);
+
   if(InpTradeEURUSD) {
     if(!g_signal_eur.Init(SYM_EUR, InpRiskUSD, InpRRRatio)) return INIT_FAILED;
+    g_signal_eur.SetMode(InpEntryMode);
     g_signal_eur.SetGeometry(InpStopRangeFrac, InpConsistentTP);
+    g_signal_eur.SetSweepParams(InpSweepMinPips, InpSweepSLBuffer,
+                                InpRangeMinPips, InpRangeMaxPips, InpRangeAtrFrac);
+    g_signal_eur.SetExecution(InpSlippagePips);
     g_atr_eur = iATR(SYM_EUR, PERIOD_H1, 14);
     if(g_atr_eur == INVALID_HANDLE) {
       Print("[FP50K] FATAL: could not create EURUSD ATR handle.");
@@ -228,13 +337,19 @@ int OnInit() {
   }
   if(InpTradeGBPUSD) {
     if(!g_signal_gbp.Init(SYM_GBP, InpRiskUSD, InpRRRatio)) return INIT_FAILED;
+    g_signal_gbp.SetMode(InpEntryMode);
     g_signal_gbp.SetGeometry(InpStopRangeFrac, InpConsistentTP);
+    g_signal_gbp.SetSweepParams(InpSweepMinPips, InpSweepSLBuffer,
+                                InpRangeMinPips, InpRangeMaxPips, InpRangeAtrFrac);
+    g_signal_gbp.SetExecution(InpSlippagePips);
     g_atr_gbp = iATR(SYM_GBP, PERIOD_H1, 14);
     if(g_atr_gbp == INVALID_HANDLE) {
       Print("[FP50K] FATAL: could not create GBPUSD ATR handle.");
       return INIT_FAILED;
     }
   }
+
+  RollTradeDay();
 
   if(g_risk.IsKilled()) {
     Print("[FP50K] FATAL: RiskManager reports killed state at startup.");
@@ -253,8 +368,13 @@ int OnInit() {
     g_validator.Init(deposit);
   }
 
-  Print("[FP50K] FP50K_EA initialised | Risk=$", DoubleToString(InpRiskUSD, 2),
-        " | RR=", DoubleToString(InpRRRatio, 1),
+  Print("[FP50K] FP50K_EA initialised | Mode=",
+        (InpEntryMode == ENTRY_MODE_SWEEP ? "SWEEP-FADE" : "BREAKOUT"),
+        " | Risk ceiling=$", DoubleToString(InpRiskUSD, 2),
+        " | RR=", DoubleToString(InpRRRatio, 2),
+        " | Slippage=", DoubleToString(InpSlippagePips, 2), "p",
+        " | News block=+/-", InpNewsBlockMin, "min",
+        " | Entry=", (InpUseLimitEntry ? "limit at swept edge" : "market on close"),
         " | Magic=", InpMagicNumber,
         " | EURUSD=", (InpTradeEURUSD ? "on" : "off"),
         " | GBPUSD=", (InpTradeGBPUSD ? "on" : "off"));
@@ -402,6 +522,12 @@ void ManageOpenPositions() {
 //+------------------------------------------------------------------+
 //| Entry logic for one symbol                                       |
 //+------------------------------------------------------------------+
+bool SendMarketEntry(string symbol, SSignal &sig, double lots,
+                     double sl, double tp, double risk_usd,
+                     double ask, double bid);
+bool SendLimitEntry(string symbol, SSignal &sig, double lots,
+                    double sl, double swept_edge, double risk_usd);
+
 void ProcessSymbol(string symbol, CSignalEngine *engine, datetime &last_bar) {
   if(engine == NULL) return;
 
@@ -412,8 +538,13 @@ void ProcessSymbol(string symbol, CSignalEngine *engine, datetime &last_bar) {
     engine.OnNewBar(symbol);
   }
 
-  // One position per symbol at a time.
+  // One position - or one waiting limit - per symbol at a time.
   if(HasOpenPosition(symbol)) return;
+  if(HasPendingOrder(symbol)) return;
+
+  // Daily entry ceiling, checked before the signal so a capped symbol costs
+  // nothing but a comparison.
+  if(InpMaxTradesDay > 0 && TradesTodayFor(symbol) >= InpMaxTradesDay) return;
 
   SSignal sig = engine.CheckSignal(symbol);
   if(!sig.valid) return;
@@ -427,14 +558,16 @@ void ProcessSymbol(string symbol, CSignalEngine *engine, datetime &last_bar) {
     return;
   }
 
-  string block_reason = "";
-  if(!g_risk.CanOpenTrade(sig.sl_pips, sig.risk_usd, symbol, block_reason)) {
-    Print("[BLOCKED] ", symbol, ": ", block_reason);
+  // One call answers "may I trade" and "how big". Size comes from live equity,
+  // capped by what is left of today's loss allowance, so a day already down
+  // cannot be finished off by a full-size trade.
+  RiskStatus rs = g_risk.EvaluateRisk(sig.sl_pips, symbol);
+  if(!rs.isTradingAllowed) {
+    Print("[BLOCKED] ", symbol, ": ", rs.statusReason);
     return;
   }
 
-  double lots = g_risk.CalculateLotSize(sig.risk_usd, sig.sl_pips, symbol);
-  lots = NormalizeLots(symbol, lots);
+  double lots = NormalizeLots(symbol, rs.maxAllowedLotSize);
   if(lots <= 0.0) {
     Print("[BLOCKED] ", symbol, ": computed lot size rounds to zero");
     return;
@@ -445,33 +578,53 @@ void ProcessSymbol(string symbol, CSignalEngine *engine, datetime &last_bar) {
   double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
   if(ask <= 0.0 || bid <= 0.0) return;
 
+  double sl = NormalizePrice(symbol, sig.stop_loss);
+  double tp = NormalizePrice(symbol, sig.take_profit);
+
+  if(InpEntryOffsetMs > 0)
+    Sleep(InpEntryOffsetMs + (int)(MathRand() % 50));
+
+  bool sent;
+  if(InpUseLimitEntry) {
+    // The limit goes at the edge the market just swept and rejected, which the
+    // signal itself does not carry - it only knows the market price it would
+    // have filled at. Read it from the range the engine measured.
+    double edge = sig.is_long ? engine.Range().GetRangeLow()
+                              : engine.Range().GetRangeHigh();
+    sent = SendLimitEntry(symbol, sig, lots, sl, edge, rs.riskUsd);
+  } else {
+    sent = SendMarketEntry(symbol, sig, lots, sl, tp, rs.riskUsd, ask, bid);
+  }
+
+  if(sent) CountTradeFor(symbol);
+}
+
+//--- SendMarketEntry: fill now, at the close of the confirming candle.
+bool SendMarketEntry(string symbol, SSignal &sig, double lots,
+                     double sl, double tp, double risk_usd,
+                     double ask, double bid) {
   double price = sig.is_long ? ask : bid;
-  double sl    = NormalizePrice(symbol, sig.stop_loss);
-  double tp    = NormalizePrice(symbol, sig.take_profit);
 
   // Price may have run past the stop while we were checking. Sending anyway
   // would either be rejected or fill with the stop on the wrong side.
   if(sig.is_long  && (price <= sl || tp <= price)) {
     Print("[BLOCKED] ", symbol, ": price moved through the long setup before send");
-    return;
+    return false;
   }
   if(!sig.is_long && (price >= sl || tp >= price)) {
     Print("[BLOCKED] ", symbol, ": price moved through the short setup before send");
-    return;
+    return false;
   }
 
   string why = "";
   if(!StopDistanceOk(symbol, price, sl, tp, why)) {
     Print("[BLOCKED] ", symbol, ": ", why);
-    return;
+    return false;
   }
 
-  if(InpEntryOffsetMs > 0)
-    Sleep(InpEntryOffsetMs + (int)(MathRand() % 50));
-
   bool sent = sig.is_long
-    ? g_trade.Buy(lots, symbol, 0.0, sl, tp, "FP50K Asian Breakout Long")
-    : g_trade.Sell(lots, symbol, 0.0, sl, tp, "FP50K Asian Breakout Short");
+    ? g_trade.Buy(lots, symbol, 0.0, sl, tp, "FP50K sweep fade long")
+    : g_trade.Sell(lots, symbol, 0.0, sl, tp, "FP50K sweep fade short");
 
   if(sent) {
     Print("[FP50K] ORDER SENT ", (sig.is_long ? "LONG " : "SHORT "), symbol,
@@ -479,13 +632,105 @@ void ProcessSymbol(string symbol, CSignalEngine *engine, datetime &last_bar) {
           " sl=", DoubleToString(sl, _Digits),
           " tp=", DoubleToString(tp, _Digits),
           " sl_pips=", DoubleToString(sig.sl_pips, 1),
-          " risk=$", DoubleToString(sig.risk_usd, 2),
+          " risk=$", DoubleToString(risk_usd, 2),
           " | ticket=", g_trade.ResultOrder());
   } else {
     Print("[FP50K] ORDER FAILED ", symbol,
           " retcode=", g_trade.ResultRetcode(),
           " (", g_trade.ResultRetcodeDescription(), ")");
   }
+  return sent;
+}
+
+//--- SendLimitEntry: wait for price to come back to the level it just rejected.
+//
+//    This is a genuinely different trade from the market entry above, not a
+//    cheaper version of it. The sweep has already closed back inside the range,
+//    so a limit AT the swept edge only fills if price returns to poke again -
+//    a better price when it fills, and no trade at all when it does not. Which
+//    of the two is better is an empirical question, which is why both exist and
+//    why this one is off by default.
+bool SendLimitEntry(string symbol, SSignal &sig, double lots,
+                    double sl, double swept_edge, double risk_usd) {
+  if(swept_edge <= 0.0) {
+    Print("[BLOCKED] ", symbol, ": no swept range edge to place a limit at");
+    return false;
+  }
+
+  double limit_price = NormalizePrice(symbol, swept_edge);
+
+  double ref = SymbolInfoDouble(symbol, sig.is_long ? SYMBOL_ASK : SYMBOL_BID);
+  if(ref <= 0.0) return false;
+
+  // A buy limit must sit BELOW the market and a sell limit above it, or the
+  // broker rejects the order outright.
+  if(sig.is_long  && limit_price >= ref) {
+    Print("[BLOCKED] ", symbol, ": buy limit would sit at or above the market");
+    return false;
+  }
+  if(!sig.is_long && limit_price <= ref) {
+    Print("[BLOCKED] ", symbol, ": sell limit would sit at or below the market");
+    return false;
+  }
+
+  // The target must be recomputed. The stop stays where it is - beyond the
+  // rejected wick - so filling at the edge instead of at the market shortens
+  // the stop distance, and a target copied from the market signal would no
+  // longer be the R:R this strategy claims to trade.
+  double stop_dist = MathAbs(limit_price - sl);
+  if(stop_dist <= 0.0) {
+    Print("[BLOCKED] ", symbol, ": limit price and stop coincide");
+    return false;
+  }
+
+  double tp = NormalizePrice(symbol,
+                sig.is_long ? (limit_price + stop_dist * InpRRRatio)
+                            : (limit_price - stop_dist * InpRRRatio));
+
+  // Lots were sized against the wider market-entry stop, so the limit fills
+  // slightly UNDER the risk budget rather than over it. That is the safe
+  // direction to be wrong in, and it is why they are not recomputed here.
+
+  string why = "";
+  if(!StopDistanceOk(symbol, limit_price, sl, tp, why)) {
+    Print("[BLOCKED] ", symbol, ": ", why);
+    return false;
+  }
+
+  // The pending order itself must also sit far enough from the market.
+  long   level = SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
+  double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+  if(level > 0 && point > 0.0 && MathAbs(ref - limit_price) < level * point) {
+    Print("[BLOCKED] ", symbol, ": limit is inside the broker's ", (int)level,
+          "-point pending-order distance");
+    return false;
+  }
+
+  // Expiry matters more here than it looks. An unfilled limit left sitting is
+  // a trade taken on tomorrow's conditions using yesterday's reasoning.
+  datetime expiry = TimeCurrent() + InpLimitExpiryMin * 60;
+
+  bool sent = sig.is_long
+    ? g_trade.BuyLimit(lots, limit_price, symbol, sl, tp,
+                       ORDER_TIME_SPECIFIED, expiry, "FP50K sweep fade long limit")
+    : g_trade.SellLimit(lots, limit_price, symbol, sl, tp,
+                        ORDER_TIME_SPECIFIED, expiry, "FP50K sweep fade short limit");
+
+  if(sent) {
+    Print("[FP50K] LIMIT PLACED ", (sig.is_long ? "LONG " : "SHORT "), symbol,
+          " lots=", DoubleToString(lots, 2),
+          " at=", DoubleToString(limit_price, _Digits),
+          " sl=", DoubleToString(sl, _Digits),
+          " tp=", DoubleToString(tp, _Digits),
+          " expires=", TimeToString(expiry, TIME_DATE | TIME_MINUTES),
+          " risk=$", DoubleToString(risk_usd, 2),
+          " | ticket=", g_trade.ResultOrder());
+  } else {
+    Print("[FP50K] LIMIT FAILED ", symbol,
+          " retcode=", g_trade.ResultRetcode(),
+          " (", g_trade.ResultRetcodeDescription(), ")");
+  }
+  return sent;
 }
 
 //+------------------------------------------------------------------+
@@ -503,7 +748,11 @@ void OnTick() {
 
   // 1. Risk governor state machine first, always. It owns the daily reset,
   //    the drawdown kill and the Friday flatten.
-  g_risk.OnTick();
+  g_risk.OnTickUpdate();
+
+  // Same server-time day boundary the governor just used, so the entry
+  // counters reset at 00:00 platform time alongside the loss allowance.
+  RollTradeDay();
 
   if(g_risk.IsKilled()) return;
 

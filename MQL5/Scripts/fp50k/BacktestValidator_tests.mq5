@@ -298,6 +298,81 @@ void OnStart()
          verdict.CompliancePassed() && verdict.CriteriaPassed() == false,
          "a run can break no rules and still not justify buying a challenge");
 
+//--- GROUP 12: Expected value - the number that actually decides a strategy.
+//    A healthy win rate at a good R:R still loses money if the average loss is
+//    bigger than the arithmetic assumed. That is not hypothetical here: the
+//    previous entry model won 60.7% of its trades and lost $5,544.
+   Check("EV per trade is net profit divided by trade count",
+         MathAbs(CBacktestValidator::ExpectedValuePerTrade(1000.0, 50) - 20.0) < 0.0001);
+   Check("A losing run reports a negative EV, not zero",
+         CBacktestValidator::ExpectedValuePerTrade(-5544.16, 112) < 0.0);
+   Check("No trades means no EV rather than a divide by zero",
+         CBacktestValidator::ExpectedValuePerTrade(1000.0, 0) == 0.0);
+
+//    38% at 2.5:1 = 0.38*2.5 - 0.62 = 0.33 R. 45% at 2:1 = 0.35 R. The bar
+//    moved with the geometry; it did not drop.
+   Check("38% at 2.5:1 is worth about a third of an R per trade",
+         MathAbs(CBacktestValidator::ExpectancyR(38.0, 2.5, 1.0) - 0.33) < 0.001,
+         "0.38 x 2.5 - 0.62 = 0.33R");
+   Check("The new bar is not materially easier than the old one",
+         MathAbs(CBacktestValidator::ExpectancyR(38.0, 2.5, 1.0)
+               - CBacktestValidator::ExpectancyR(45.0, 2.0, 1.0)) < 0.05,
+         "0.325R at 2.5:1 vs 0.350R at 2:1 - a restatement, not a relaxation");
+   Check("A coin flip at 1:1 has zero expectancy",
+         MathAbs(CBacktestValidator::ExpectancyR(50.0, 1.0, 1.0)) < 1e-9);
+   Check("The measured 30.7% at 2:1 is negative expectancy",
+         CBacktestValidator::ExpectancyR(30.7, 2.0, 1.0) < 0.0,
+         "this is the result that ended the breakout model");
+   Check("A zero average loss returns zero rather than dividing by it",
+         CBacktestValidator::ExpectancyR(50.0, 2.0, 0.0) == 0.0);
+
+   Check("Break-even at 2.5:1 is 28.6%",
+         MathAbs(CBacktestValidator::BreakEvenWinRatePct(2.5) - 28.5714) < 0.001);
+   Check("Break-even at 2:1 is 33.3%",
+         MathAbs(CBacktestValidator::BreakEvenWinRatePct(2.0) - 33.3333) < 0.001);
+   Check("Break-even at 1:1 is 50%",
+         MathAbs(CBacktestValidator::BreakEvenWinRatePct(1.0) - 50.0) < 0.001);
+   Check("The 38% target clears break-even at 2.5:1 with room to spare",
+         BT_SWEEP_MIN_WIN_PCT > CBacktestValidator::BreakEvenWinRatePct(2.5) + 5.0);
+
+//--- GROUP 13: Daily drawdown as a percentage, which is how the firm's rule
+//    is written. Tracked separately from peak-to-trough: a run can pass one
+//    and fail the other, and reporting only one hides that.
+   CBacktestValidator ddpct;
+   ddpct.Init(50000.0);
+   ddpct.Feed(D(0, 1), 50000.0, 50000.0);
+   ddpct.Feed(D(0, 9), 48500.0, 48500.0);   // -$1,500 = 3.0% of the day's open
+   ddpct.Feed(D(1, 1), 48500.0, 48500.0);   // closes day 0
+   ddpct.Finalise(0);
+
+   Check("Worst daily drawdown is measured against that day's baseline",
+         MathAbs(ddpct.WorstDailyDDPct() - 3.0) < 0.01,
+         DoubleToString(ddpct.WorstDailyDDPct(), 2) + "%");
+   Check("A 3% day stays inside the 4% daily buffer",
+         ddpct.WorstDailyDDPct() < BT_MAX_DAILY_DD_PCT);
+   Check("The daily buffer sits inside the firm's 5% rule",
+         BT_MAX_DAILY_DD_PCT < 5.0);
+   Check("The overall buffer sits inside the firm's 10% rule",
+         BT_MAX_OVERALL_DD_PCT < 10.0);
+
+//--- The high-water baseline. A day opened with a position floating at a loss
+//    must be measured from the higher of balance and equity, or the drawdown
+//    it goes on to suffer is understated.
+   CBacktestValidator hwm;
+   hwm.Init(50000.0);
+   hwm.Feed(D(0, 1), 49000.0, 50000.0);     // equity below balance at the open
+   hwm.Feed(D(0, 9), 48000.0, 50000.0);     // $2,000 below the BALANCE baseline
+   hwm.Feed(D(1, 1), 48000.0, 48000.0);     // closes day 0
+   hwm.Finalise(0);
+
+   Check("The day is measured from balance when equity opened lower",
+         MathAbs(hwm.WorstDailyLoss() - 2000.0) < 0.01,
+         DoubleToString(hwm.WorstDailyLoss(), 2) +
+         " - anchoring to the $49,000 equity would have reported only $1,000");
+   Check("That understated day would have hidden a wall breach",
+         hwm.WallHits() == 1,
+         "the firm's $2,000 wall was reached; equity-anchoring would have missed it");
+
 //--- Summary
    Print("[QA] ===== RESULT: ", test_passed, " passed, ", test_failed, " failed =====");
   }

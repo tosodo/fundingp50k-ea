@@ -1,9 +1,29 @@
 //+------------------------------------------------------------------+
 //| SignalEngine.mqh                                                  |
 //| FP50K-EA | Signal Engine                                          |
-//| Wires AsianRange with an H4 trend filter                          |
+//| Asian Liquidity Sweep & Fade, with an H4 EMA bias filter          |
 //| Returns a structured signal - never self-executes                 |
 //+------------------------------------------------------------------+
+//
+// Why this file changed shape in July 2026:
+//
+//   The original entry was an Asian-range BREAKOUT plus retest. Twenty
+//   backtest variants established that it had no edge - with all trade
+//   management stripped away it won 24.6-30.7% at 2:1, against the 33.3%
+//   needed just to break even, and 45.8% at 1:1 against the 50% needed. The
+//   losses were not coming from the exits; the entry simply did not predict
+//   direction. See Docs/backtest_results.md for the full evidence.
+//
+//   The replacement is the opposite trade. Instead of buying the break of the
+//   Asian high, it SELLS a poke above the Asian high that fails and closes
+//   back inside the range - the classic stop-run, where the move exists to
+//   collect resting orders rather than to go anywhere. The premise is testable
+//   and, importantly, it is not a tuned version of the old idea: it trades in
+//   the other direction, so a flat result here is genuine new information.
+//
+//   The breakout path is kept, unchanged, behind ENTRY_MODE_BREAKOUT. It is
+//   the control. A new signal that cannot beat a known-worthless one on the
+//   same data has not been demonstrated to work.
 
 #ifndef _SIGNALENGINE_MQH_
 #define _SIGNALENGINE_MQH_
@@ -17,6 +37,7 @@
 
 //--- H4 trend filter
 #define H4_MA_PERIOD     50
+#define H4_EMA_PERIOD    50
 
 //--- Stop placed this far beyond the far side of the range
 #define SL_BUFFER_PIPS    2.0
@@ -24,6 +45,40 @@
 //--- Session bounds (UTC) - mirrors the RiskManager gate
 #define SIG_SESSION_OPEN_HOUR   7
 #define SIG_SESSION_CLOSE_HOUR  17
+
+//+------------------------------------------------------------------+
+//| Sweep & fade defaults                                             |
+//+------------------------------------------------------------------+
+//--- How far past the range edge counts as a sweep rather than a graze.
+//    Below this the "sweep" is inside the spread and means nothing.
+#define SWEEP_MIN_PIPS        3.0
+
+//--- Stop goes this far beyond the sweeping candle's extreme wick. The wick is
+//    the level the market has just proved it will not hold; the buffer covers
+//    the spread on the exit side.
+#define SWEEP_SL_BUFFER_PIPS  2.0
+
+//--- Volatility coiling filter. A fade needs a range that has compressed; a
+//    wide Asian session usually means a trend is already running, and fading a
+//    trend is how an account dies.
+#define SWEEP_MIN_RANGE_PIPS  8.0
+#define SWEEP_MAX_RANGE_PIPS  40.0
+
+//--- ...and the same idea expressed relative to recent volatility, so it keeps
+//    meaning something if the pair's character changes.
+#define SWEEP_ATR_FRACTION    0.60
+#define ATR_D1_PERIOD         14
+
+//--- Trigger timeframe for the sweep itself
+#define SWEEP_TIMEFRAME       PERIOD_M5
+
+//+------------------------------------------------------------------+
+//| Which entry model the engine is running                           |
+//+------------------------------------------------------------------+
+enum ENTRY_MODE {
+  ENTRY_MODE_SWEEP    = 0,   // Asian liquidity sweep & fade (current)
+  ENTRY_MODE_BREAKOUT = 1    // Legacy Asian breakout + retest (control)
+};
 
 //+------------------------------------------------------------------+
 //| SSignal - a proposed trade. Always check .valid first.            |
@@ -70,25 +125,114 @@ private:
   bool        m_consistent_tp;    // false = target measured from the range
 
   // Indicator handles are a finite resource - create once, reuse, release.
-  int         m_ma_handle;
+  int         m_ma_handle;       // H4 SMA(50) - legacy breakout trend filter
+  int         m_ema_handle;      // H4 EMA(50) - sweep & fade bias filter
+  int         m_atr_d1_handle;   // D1 ATR(14) - volatility coiling filter
+
+  //--- Sweep & fade configuration
+  ENTRY_MODE  m_mode;
+  double      m_sweep_min_pips;
+  double      m_sweep_sl_buffer;
+  double      m_range_min_pips;
+  double      m_range_max_pips;
+  double      m_range_atr_frac;
+
+  //--- Assumed adverse fill, in pips. The Strategy Tester fills at the exact
+  //    quote, which no live account ever does. Charging this against the
+  //    geometry makes a backtest cost what a real fill costs.
+  double      m_slippage_pips;
+
+  //--- One evaluation per closed M5 bar. Without this the same sweep is
+  //    re-detected on every tick until the bar rolls, which in the tester
+  //    silently multiplies one setup into hundreds.
+  datetime    m_last_sweep_bar;
 
   double      PipSize(string symbol);
   SSignal     Invalid(string symbol, string reason);
+  double      AtrPips(string symbol);
 
 public:
   CSignalEngine();
   ~CSignalEngine();
 
-  bool    Init(string symbol, double risk_usd = 500.0, double rr = 2.0);
+  bool    Init(string symbol, double risk_usd = 375.0, double rr = 2.5);
 
   // Optional geometry override, applied after Init(). Left alone, the engine
   // keeps the original range-width stop and range-measured target.
   void    SetGeometry(double stop_range_frac, bool consistent_tp);
 
+  //--- Sweep & fade configuration. All optional; the defaults above apply.
+  void    SetMode(ENTRY_MODE mode);
+  void    SetSweepParams(double sweep_min_pips, double sl_buffer_pips,
+                         double range_min_pips, double range_max_pips,
+                         double range_atr_frac);
+  void    SetExecution(double slippage_pips);
+
   void    OnNewBar(string symbol);
   SSignal CheckSignal(string symbol);
+  SSignal CheckSweepSignal(string symbol);
+  SSignal CheckBreakoutSignal(string symbol);
   int     GetH4Trend(string symbol);
+  int     GetH4Bias(string symbol);
   bool    IsLondonSession();
+
+  //--- Pure sweep detection. Everything the rule needs is an argument, so a
+  //    test can present a synthetic candle instead of waiting for a real
+  //    stop-run to happen on a live chart.
+
+  //--- Threshold tolerance. Prices are binary floating point: 1.1003 - 1.1000
+  //    evaluates to 0.00029999999999996696, which divides out to 2.9999999999
+  //    pips and fails a ">= 3.0" test. Without this slack a poke of exactly the
+  //    configured depth is rejected roughly half the time, depending on where
+  //    the two prices happen to land in binary - a filter that silently drops
+  //    valid setups for no reason a chart would ever show.
+  //    1e-6 of a pip is far below any price move that exists.
+  #define SWEEP_PIP_EPSILON  1e-6
+
+  //--- A sell setup: the candle poked above the range high by at least
+  //    min_sweep_pips, then closed back below it. Both halves are required -
+  //    a poke that closes outside is a breakout, which is the opposite trade.
+  static bool IsSweepAbove(double bar_high, double bar_close,
+                           double range_high, double pip, double min_sweep_pips) {
+    if(pip <= 0.0 || range_high <= 0.0) return false;
+    if(bar_high <= 0.0 || bar_close <= 0.0) return false;
+
+    bool poked  = ((bar_high - range_high) / pip) >= (min_sweep_pips - SWEEP_PIP_EPSILON);
+    bool closed_back = (bar_close < range_high);
+    return (poked && closed_back);
+  }
+
+  //--- A buy setup: the mirror image below the range low.
+  static bool IsSweepBelow(double bar_low, double bar_close,
+                           double range_low, double pip, double min_sweep_pips) {
+    if(pip <= 0.0 || range_low <= 0.0) return false;
+    if(bar_low <= 0.0 || bar_close <= 0.0) return false;
+
+    bool poked  = ((range_low - bar_low) / pip) >= (min_sweep_pips - SWEEP_PIP_EPSILON);
+    bool closed_back = (bar_close > range_low);
+    return (poked && closed_back);
+  }
+
+  //--- Volatility coiling. Both the absolute pip band and the ATR ratio must
+  //    hold. An atr_pips of zero means the daily ATR is unavailable, in which
+  //    case the ratio test is skipped rather than silently failing everything.
+  static bool RangeVolatilityOk(double range_pips, double atr_pips,
+                                double min_pips, double max_pips, double atr_frac) {
+    if(range_pips < min_pips || range_pips > max_pips) return false;
+    if(atr_pips > 0.0 && atr_frac > 0.0 && range_pips > atr_pips * atr_frac)
+      return false;
+    return true;
+  }
+
+  //--- Pure sweep geometry. Stop sits beyond the sweeping wick, target is a
+  //    fixed multiple of that stop measured from the entry - so the nominal
+  //    R:R is the R:R actually delivered, which the old range-measured target
+  //    was not. slippage_pips shifts the reference price against us before
+  //    anything is measured, so the stop lands nearer and the target further.
+  SSignal BuildSweepSignal(string symbol, bool is_long,
+                           double sweep_high, double sweep_low,
+                           double ask, double bid, double pip, double rr,
+                           double sl_buffer_pips, double slippage_pips);
 
   // Pure entry geometry: every input is passed in, nothing is read from the
   // market. CheckSignal() feeds it live values; tests feed it fixed ones, which
@@ -107,12 +251,23 @@ public:
 
 //--- Constructor
 CSignalEngine::CSignalEngine() {
-  m_rr_ratio        = 2.0;
-  m_risk_usd        = 500.0;
+  m_rr_ratio        = 2.5;
+  m_risk_usd        = 375.0;
   m_symbol          = "";
   m_ma_handle       = INVALID_HANDLE;
+  m_ema_handle      = INVALID_HANDLE;
+  m_atr_d1_handle   = INVALID_HANDLE;
   m_stop_range_frac = 0.0;
   m_consistent_tp   = false;
+
+  m_mode            = ENTRY_MODE_SWEEP;
+  m_sweep_min_pips  = SWEEP_MIN_PIPS;
+  m_sweep_sl_buffer = SWEEP_SL_BUFFER_PIPS;
+  m_range_min_pips  = SWEEP_MIN_RANGE_PIPS;
+  m_range_max_pips  = SWEEP_MAX_RANGE_PIPS;
+  m_range_atr_frac  = SWEEP_ATR_FRACTION;
+  m_slippage_pips   = 0.0;
+  m_last_sweep_bar  = 0;
 }
 
 //--- Destructor
@@ -120,6 +275,14 @@ CSignalEngine::~CSignalEngine() {
   if(m_ma_handle != INVALID_HANDLE) {
     IndicatorRelease(m_ma_handle);
     m_ma_handle = INVALID_HANDLE;
+  }
+  if(m_ema_handle != INVALID_HANDLE) {
+    IndicatorRelease(m_ema_handle);
+    m_ema_handle = INVALID_HANDLE;
+  }
+  if(m_atr_d1_handle != INVALID_HANDLE) {
+    IndicatorRelease(m_atr_d1_handle);
+    m_atr_d1_handle = INVALID_HANDLE;
   }
 }
 
@@ -140,10 +303,79 @@ bool CSignalEngine::Init(string symbol, double risk_usd, double rr) {
     return false;
   }
 
+  m_ema_handle = iMA(symbol, PERIOD_H4, H4_EMA_PERIOD, 0, MODE_EMA, PRICE_CLOSE);
+  if(m_ema_handle == INVALID_HANDLE) {
+    Print("[SignalEngine] ERROR: could not create H4 EMA handle for ", symbol);
+    return false;
+  }
+
+  // The daily ATR is a filter, not a trigger. If the broker has no daily
+  // history the volatility ratio is skipped and the pip band still applies -
+  // refusing to start over a missing filter would be worse than running
+  // slightly less selectively.
+  m_atr_d1_handle = iATR(symbol, PERIOD_D1, ATR_D1_PERIOD);
+  if(m_atr_d1_handle == INVALID_HANDLE)
+    Print("[SignalEngine] WARNING: no D1 ATR handle for ", symbol,
+          " - the ATR coiling filter will be skipped.");
+
+  m_last_sweep_bar = 0;
+
   Print("[SignalEngine] Initialized ", symbol,
+        " mode=", (m_mode == ENTRY_MODE_SWEEP ? "SWEEP-FADE" : "BREAKOUT"),
         " risk=$", DoubleToString(m_risk_usd, 2),
-        " rr=", DoubleToString(m_rr_ratio, 1));
+        " rr=", DoubleToString(m_rr_ratio, 2));
   return true;
+}
+
+//--- SetMode: choose the entry model. The breakout is retained as a control.
+void CSignalEngine::SetMode(ENTRY_MODE mode) {
+  m_mode = mode;
+  Print("[SignalEngine] Entry mode ", m_symbol, " = ",
+        (m_mode == ENTRY_MODE_SWEEP ? "SWEEP-FADE (fade the failed poke)"
+                                    : "BREAKOUT (legacy control)"));
+}
+
+//--- SetSweepParams: a non-positive value leaves that parameter at its default,
+//    so a caller can override one setting without restating all five.
+void CSignalEngine::SetSweepParams(double sweep_min_pips, double sl_buffer_pips,
+                                   double range_min_pips, double range_max_pips,
+                                   double range_atr_frac) {
+  if(sweep_min_pips > 0.0) m_sweep_min_pips  = sweep_min_pips;
+  if(sl_buffer_pips > 0.0) m_sweep_sl_buffer = sl_buffer_pips;
+  if(range_min_pips > 0.0) m_range_min_pips  = range_min_pips;
+  if(range_max_pips > 0.0) m_range_max_pips  = range_max_pips;
+
+  // Zero is meaningful here: it switches the ATR ratio filter off.
+  if(range_atr_frac >= 0.0) m_range_atr_frac = range_atr_frac;
+
+  Print("[SignalEngine] Sweep params ", m_symbol,
+        " min_sweep=", DoubleToString(m_sweep_min_pips, 1), "p",
+        " sl_buffer=", DoubleToString(m_sweep_sl_buffer, 1), "p",
+        " range=", DoubleToString(m_range_min_pips, 1), "-",
+        DoubleToString(m_range_max_pips, 1), "p",
+        " atr_frac=", DoubleToString(m_range_atr_frac, 2));
+}
+
+//--- SetExecution: assumed adverse fill in pips, charged against the geometry.
+void CSignalEngine::SetExecution(double slippage_pips) {
+  m_slippage_pips = (slippage_pips > 0.0) ? slippage_pips : 0.0;
+  Print("[SignalEngine] Execution ", m_symbol, " slippage=",
+        DoubleToString(m_slippage_pips, 2), " pips charged against every entry");
+}
+
+//--- AtrPips: daily ATR expressed in pips. Zero means unavailable.
+double CSignalEngine::AtrPips(string symbol) {
+  if(m_atr_d1_handle == INVALID_HANDLE) return 0.0;
+
+  double pip = PipSize(symbol);
+  if(pip <= 0.0) return 0.0;
+
+  double buf[];
+  // Bar 1, not 0 - the forming day's ATR moves under us tick by tick.
+  if(CopyBuffer(m_atr_d1_handle, 0, 1, 1, buf) < 1) return 0.0;
+  if(buf[0] <= 0.0) return 0.0;
+
+  return buf[0] / pip;
 }
 
 //--- SetGeometry: change where the stop and target go.
@@ -188,7 +420,7 @@ void CSignalEngine::OnNewBar(string symbol) {
 //--- IsLondonSession: 07:00-17:00 UTC, Monday to Friday
 bool CSignalEngine::IsLondonSession() {
   MqlDateTime dt;
-  TimeToStruct(TimeGMT(), dt);
+  TimeToStruct(FpNowUtc(), dt);
 
   if(dt.day_of_week < 1 || dt.day_of_week > 5) return false;
   if(dt.hour < SIG_SESSION_OPEN_HOUR || dt.hour >= SIG_SESSION_CLOSE_HOUR) return false;
@@ -223,6 +455,35 @@ int CSignalEngine::GetH4Trend(string symbol) {
   if(bullish) return TREND_BULL;
   if(bearish) return TREND_BEAR;
 
+  return TREND_AMBIGUOUS;
+}
+
+//--- GetH4Bias: the sweep model's trend filter. Deliberately simpler than
+//    GetH4Trend above - price on one side of the H4 EMA(50), nothing more.
+//
+//    The three-consecutive-closes rule the breakout used is a momentum test,
+//    and momentum is the wrong question for a fade: by the time three H4 bars
+//    have run in one direction, the pullback being faded is usually over. This
+//    only asks which side of the mean price is on, which is what decides
+//    whether a failed poke is a reversal or a trap.
+int CSignalEngine::GetH4Bias(string symbol) {
+  if(m_ema_handle == INVALID_HANDLE) return TREND_AMBIGUOUS;
+
+  // Bar 1 - the last CLOSED H4 bar. Bar 0 repaints until it closes.
+  double close = iClose(symbol, PERIOD_H4, 1);
+  if(close <= 0.0) return TREND_AMBIGUOUS;
+
+  double ema[];
+  if(CopyBuffer(m_ema_handle, 0, 1, 1, ema) < 1) {
+    Print("[SignalEngine] H4 EMA not ready for ", symbol, " - bias ambiguous");
+    return TREND_AMBIGUOUS;
+  }
+  if(ema[0] <= 0.0) return TREND_AMBIGUOUS;
+
+  if(close > ema[0]) return TREND_BULL;
+  if(close < ema[0]) return TREND_BEAR;
+
+  // Exactly on the EMA. Rare, but it is genuinely no information.
   return TREND_AMBIGUOUS;
 }
 
@@ -290,8 +551,179 @@ SSignal CSignalEngine::BuildSignal(string symbol, bool is_long,
   return s;
 }
 
-//--- CheckSignal: the full entry sequence. Returns a struct; never trades.
+//--- BuildSweepSignal: pure fade geometry - no market access, fully testable
+SSignal CSignalEngine::BuildSweepSignal(string symbol, bool is_long,
+                                        double sweep_high, double sweep_low,
+                                        double ask, double bid, double pip, double rr,
+                                        double sl_buffer_pips, double slippage_pips) {
+  if(pip <= 0.0)
+    return Invalid(symbol, "Cannot resolve pip size");
+
+  if(ask <= 0.0 || bid <= 0.0)
+    return Invalid(symbol, "No live quote available");
+
+  if(sweep_high <= 0.0 || sweep_low <= 0.0 || sweep_high <= sweep_low)
+    return Invalid(symbol, "Sweeping candle high is not above its low");
+
+  if(rr <= 0.0)
+    return Invalid(symbol, "Reward-to-risk ratio must be positive");
+
+  SSignal s;
+  s.valid       = true;
+  s.is_long     = is_long;
+  s.symbol      = symbol;
+  s.risk_usd    = m_risk_usd;
+  s.signal_time = TimeCurrent();
+
+  // The reference price is the live quote made WORSE by the assumed slippage:
+  // a buy fills higher than the ask, a sell lower than the bid. Measuring the
+  // stop and target from that point is what makes the penalty real - the stop
+  // ends up nearer than it looks and the target further away, exactly as an
+  // adverse fill does to a live trade.
+  double slip = slippage_pips * pip;
+  s.entry_price = is_long ? (ask + slip) : (bid - slip);
+
+  if(s.entry_price <= 0.0)
+    return Invalid(symbol, "Slippage-adjusted entry price is not positive");
+
+  // --- Stop: beyond the wick the market just rejected ----------------------
+  double buffer = sl_buffer_pips * pip;
+  s.stop_loss = is_long ? (sweep_low  - buffer)
+                        : (sweep_high + buffer);
+
+  s.sl_pips = (is_long ? (s.entry_price - s.stop_loss)
+                       : (s.stop_loss - s.entry_price)) / pip;
+
+  // Price ran through the setup between the candle closing and this quote
+  // being read. Refuse rather than send an order whose stop is on the wrong
+  // side of the entry.
+  if(s.sl_pips <= 0.0)
+    return Invalid(symbol, "Sweep stop is on the wrong side of the entry");
+
+  // --- Target: a fixed multiple of the ACTUAL stop, from the entry ---------
+  double reward = s.sl_pips * rr * pip;
+  s.take_profit = is_long ? (s.entry_price + reward)
+                          : (s.entry_price - reward);
+
+  s.reason = StringFormat(
+    "Asian liquidity sweep faded | %s | stop %.1fp | target %.1f:1",
+    (is_long ? "LONG (swept the low)" : "SHORT (swept the high)"),
+    s.sl_pips, rr);
+
+  return s;
+}
+
+//--- CheckSweepSignal: the live sweep & fade sequence. Returns a struct only.
+SSignal CSignalEngine::CheckSweepSignal(string symbol) {
+  // 1. Session
+  if(!IsLondonSession())
+    return Invalid(symbol, "Outside session");
+
+  // 2. The Asian range must exist. Its own MIN/MAX filter is separate from and
+  //    wider than the coiling filter applied below.
+  if(!m_asian_range.IsRangeSet())
+    return Invalid(symbol, "Asian range not measured yet");
+
+  double range_high = m_asian_range.GetRangeHigh();
+  double range_low  = m_asian_range.GetRangeLow();
+  double range_pips = m_asian_range.GetRangePips();
+
+  double pip = PipSize(symbol);
+  if(pip <= 0.0)
+    return Invalid(symbol, "Cannot resolve pip size");
+
+  // 3. Volatility coiling
+  double atr_pips = AtrPips(symbol);
+  if(!RangeVolatilityOk(range_pips, atr_pips,
+                        m_range_min_pips, m_range_max_pips, m_range_atr_frac))
+    return Invalid(symbol, StringFormat(
+      "Range %.1fp outside the coiling band %.1f-%.1fp (D1 ATR %.1fp)",
+      range_pips, m_range_min_pips, m_range_max_pips, atr_pips));
+
+  // 4. One evaluation per closed M5 bar, not per tick.
+  datetime bar_time = iTime(symbol, SWEEP_TIMEFRAME, 1);
+  if(bar_time <= 0)
+    return Invalid(symbol, "No closed M5 bar available");
+  if(bar_time == m_last_sweep_bar)
+    return Invalid(symbol, "This M5 bar has already been evaluated");
+
+  // 5. The sweeping candle: the last CLOSED M5 bar
+  double bar_high  = iHigh(symbol,  SWEEP_TIMEFRAME, 1);
+  double bar_low   = iLow(symbol,   SWEEP_TIMEFRAME, 1);
+  double bar_close = iClose(symbol, SWEEP_TIMEFRAME, 1);
+  if(bar_high <= 0.0 || bar_low <= 0.0 || bar_close <= 0.0)
+    return Invalid(symbol, "Incomplete M5 bar data");
+
+  bool sweep_up   = IsSweepAbove(bar_high, bar_close, range_high, pip, m_sweep_min_pips);
+  bool sweep_down = IsSweepBelow(bar_low,  bar_close, range_low,  pip, m_sweep_min_pips);
+
+  if(!sweep_up && !sweep_down)
+    return Invalid(symbol, "No failed sweep on the last M5 bar");
+
+  // A bar that swept BOTH edges and closed inside is a whipsaw, not a setup -
+  // there is no way to say which side got trapped.
+  if(sweep_up && sweep_down) {
+    m_last_sweep_bar = bar_time;
+    return Invalid(symbol, "Bar swept both range edges - direction undecidable");
+  }
+
+  // 6. Trend alignment. A sweep of the HIGH is faded SHORT, so it needs a
+  //    bearish H4 bias; a sweep of the LOW is faded LONG.
+  bool is_long = sweep_down;
+  int  bias    = GetH4Bias(symbol);
+
+  if(bias == TREND_AMBIGUOUS) {
+    m_last_sweep_bar = bar_time;
+    return Invalid(symbol, "H4 bias ambiguous");
+  }
+  if(is_long && bias != TREND_BULL) {
+    m_last_sweep_bar = bar_time;
+    return Invalid(symbol, "Low swept but H4 bias is bearish - no counter-trend longs");
+  }
+  if(!is_long && bias != TREND_BEAR) {
+    m_last_sweep_bar = bar_time;
+    return Invalid(symbol, "High swept but H4 bias is bullish - no counter-trend shorts");
+  }
+
+  double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
+  double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
+  if(ask <= 0.0 || bid <= 0.0)
+    return Invalid(symbol, "No live quote available");
+
+  // Marked before the geometry runs. Whatever happens below, this bar has now
+  // had its one evaluation - otherwise a geometry rejection would let the same
+  // bar be retried on the next tick, and the next, until it rolled.
+  m_last_sweep_bar = bar_time;
+
+  // 7. Geometry
+  SSignal s = BuildSweepSignal(symbol, is_long, bar_high, bar_low,
+                               ask, bid, pip, m_rr_ratio,
+                               m_sweep_sl_buffer, m_slippage_pips);
+  if(!s.valid) return s;
+
+  // 8. Log
+  Print("[SignalEngine] SWEEP SIGNAL ", (s.is_long ? "LONG " : "SHORT "), symbol,
+        " range=", DoubleToString(range_pips, 1), "p",
+        " sweep_bar=", TimeToString(bar_time, TIME_DATE | TIME_MINUTES),
+        " entry=", DoubleToString(s.entry_price, _Digits),
+        " sl=",    DoubleToString(s.stop_loss,   _Digits),
+        " tp=",    DoubleToString(s.take_profit, _Digits),
+        " sl_pips=", DoubleToString(s.sl_pips, 1),
+        " | ", s.reason);
+
+  return s;
+}
+
+//--- CheckSignal: dispatch to whichever entry model is configured.
 SSignal CSignalEngine::CheckSignal(string symbol) {
+  if(m_mode == ENTRY_MODE_SWEEP) return CheckSweepSignal(symbol);
+  return CheckBreakoutSignal(symbol);
+}
+
+//--- CheckBreakoutSignal: the legacy entry, unchanged. Retained as a control -
+//    it is known to have no edge, so any replacement must beat it on the same
+//    data before the replacement can be said to work.
+SSignal CSignalEngine::CheckBreakoutSignal(string symbol) {
   // 1. Session
   if(!IsLondonSession())
     return Invalid(symbol, "Outside session");

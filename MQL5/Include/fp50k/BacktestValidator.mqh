@@ -48,6 +48,13 @@
 #define BT_MIN_WIN_RATE_PCT     45.0
 #define BT_PHASE1_MAX_SESSIONS  30
 
+//--- Sweep & fade acceptance targets (July 2026 upgrade spec). At 2.5:1 the
+//    break-even hit rate is 28.6%, so 38% is a real margin rather than a
+//    rounding error - which is the whole point of stating it in advance.
+#define BT_SWEEP_MIN_WIN_PCT    38.0
+#define BT_MAX_DAILY_DD_PCT      4.0
+#define BT_MAX_OVERALL_DD_PCT    9.0
+
 class CBacktestValidator {
 private:
   bool     m_active;
@@ -74,6 +81,11 @@ private:
   int      m_soft_hits;        // days touching our $1,000 soft stop
   double   m_worst_daily_loss;
   datetime m_worst_day;
+
+  // Worst intraday fall as a percentage of the baseline that day opened at.
+  // Tracked separately from the peak-to-trough figure above because the firm
+  // judges the two by different rules and a run can pass one and fail the other.
+  double   m_worst_daily_dd_pct;
 
   //--- Equity floor
   bool     m_floor_breached;
@@ -132,6 +144,31 @@ public:
     return (double)wins * 100.0 / (double)trades;
   }
 
+  //--- Expected value per trade: what one trade is worth on average, in
+  //    dollars. This is the number that decides whether a strategy is worth
+  //    running at all - a positive win rate at a good R:R still loses money if
+  //    the average loss is bigger than the arithmetic assumed.
+  static double ExpectedValuePerTrade(double net_profit, int trades) {
+    if(trades <= 0) return 0.0;
+    return net_profit / (double)trades;
+  }
+
+  //--- The same figure in R multiples, which travels between account sizes.
+  //    avg_loss is given as a positive number.
+  static double ExpectancyR(double win_rate_pct, double avg_win, double avg_loss) {
+    if(avg_loss <= 0.0) return 0.0;
+    double p = win_rate_pct / 100.0;
+    return (p * avg_win - (1.0 - p) * avg_loss) / avg_loss;
+  }
+
+  //--- The hit rate a given reward-to-risk ratio needs just to break even,
+  //    before costs. Printed beside the measured rate so the verdict does not
+  //    depend on the reader doing the arithmetic.
+  static double BreakEvenWinRatePct(double rr) {
+    if(rr <= 0.0) return 100.0;
+    return 100.0 / (1.0 + rr);
+  }
+
   //--- Gross win over gross loss, both given as positive numbers. With no
   //    losing trades the ratio is undefined; 999 is returned as a
   //    recognisable sentinel rather than an infinity that formats badly.
@@ -158,6 +195,10 @@ public:
   //--- Getters, used by the report and by the tests
   double   MaxDDPct()        { return m_max_dd_pct; }
   double   WorstDailyLoss()  { return m_worst_daily_loss; }
+  double   WorstDailyDDPct() { return m_worst_daily_dd_pct; }
+  double   AvgWin()          { return (m_wins   > 0) ? m_gross_win  / m_wins   : 0.0; }
+  double   AvgLoss()         { return (m_losses > 0) ? m_gross_loss / m_losses : 0.0; }
+  double   EVPerTrade()      { return ExpectedValuePerTrade(m_net_profit, m_trades); }
   int      DaysTracked()     { return m_days; }
   int      WallHits()        { return m_wall_hits; }
   int      HardStopHits()    { return m_hard_hits; }
@@ -197,6 +238,7 @@ CBacktestValidator::CBacktestValidator() {
   m_soft_hits        = 0;
   m_worst_daily_loss = 0.0;
   m_worst_day        = 0;
+  m_worst_daily_dd_pct = 0.0;
 
   m_floor_breached   = false;
   m_floor_time       = 0;
@@ -256,6 +298,13 @@ void CBacktestValidator::CloseDay() {
     m_worst_day        = m_last_time;
   }
 
+  // Same fall, expressed against the baseline the day opened at - the form the
+  // firm's 5% daily rule is actually written in.
+  if(m_day_anchor > 0.0) {
+    double day_dd_pct = m_day_worst_loss / m_day_anchor * 100.0;
+    if(day_dd_pct > m_worst_daily_dd_pct) m_worst_daily_dd_pct = day_dd_pct;
+  }
+
   if(m_day_worst_loss >= BT_FIRM_DAILY_WALL) {
     m_wall_hits++;
     Print("[Validator] DAILY WALL BREACHED on ", TimeToString(m_last_time, TIME_DATE),
@@ -288,17 +337,22 @@ void CBacktestValidator::Feed(datetime now, double equity, double balance) {
   m_last_equity = equity;
 
   //--- Day rollover
+  // The baseline is the HIGHER of balance and equity, matching the rule the
+  // firm applies at the 00:00 platform-time reset. On a day opened with a
+  // position floating at a loss, anchoring to equity alone would quietly
+  // forgive the money already down and understate the day's drawdown.
   long idx = DayIndexOf(now);
+  double baseline = MathMax(balance, equity);
   if(!m_day_open) {
     m_day_open       = true;
     m_day_index      = idx;
-    m_day_anchor     = equity;
+    m_day_anchor     = baseline;
     m_day_worst_loss = 0.0;
   } else if(idx != m_day_index) {
     CloseDay();
     m_day_open       = true;
     m_day_index      = idx;
-    m_day_anchor     = equity;
+    m_day_anchor     = baseline;
     m_day_worst_loss = 0.0;
   }
 
@@ -400,12 +454,22 @@ bool CBacktestValidator::CompliancePassed() {
   return (!m_floor_breached && m_wall_hits == 0 && m_hard_hits == 0);
 }
 
-//--- CriteriaPassed: the full "is this worth buying a challenge for" test
+//--- CriteriaPassed: the full "is this worth buying a challenge for" test.
+//
+//    The win-rate bar moved from 45% to 38% when the strategy moved from a 2:1
+//    to a 2.5:1 target. That is a restatement, not a relaxation: 45% at 2:1 is
+//    0.35 R per trade and 38% at 2.5:1 is 0.33 R - the same demand, expressed
+//    for the new geometry. The EV floor below is what stops the lower headline
+//    number becoming a loophole; a strategy can clear 38% and still lose money
+//    if its average loss is bigger than the arithmetic assumed, and that has
+//    already happened once on this project.
 bool CBacktestValidator::CriteriaPassed() {
   if(!CompliancePassed()) return false;
   if(m_trades < BT_MIN_TRADES) return false;
   if(m_max_dd_pct >= BT_MAX_DD_PCT) return false;
-  if(WinRatePct(m_wins, m_trades) < BT_MIN_WIN_RATE_PCT) return false;
+  if(m_worst_daily_dd_pct >= BT_MAX_DAILY_DD_PCT) return false;
+  if(WinRatePct(m_wins, m_trades) < BT_SWEEP_MIN_WIN_PCT) return false;
+  if(EVPerTrade() <= 0.0) return false;
   return true;
 }
 
@@ -460,8 +524,21 @@ void CBacktestValidator::Report(ulong magic) {
                         win_rate, BT_MIN_WIN_RATE_PCT));
   Emit(fh, StringFormat(" Profit factor      : %.2f", pf));
   Emit(fh, "------------------------------------------------------------------");
+  Emit(fh, StringFormat(" EV per trade       : $%.2f   <-- the number that decides it",
+                        EVPerTrade()));
+  Emit(fh, StringFormat(" Average win        : $%.2f", AvgWin()));
+  Emit(fh, StringFormat(" Average loss       : $%.2f", AvgLoss()));
+  Emit(fh, StringFormat(" Expectancy         : %.3f R per trade",
+                        ExpectancyR(win_rate, AvgWin(), AvgLoss())));
+  Emit(fh, StringFormat(" Sweep-model target : %.1f%% win rate (break-even at 2.5:1 is %.1f%%)",
+                        BT_SWEEP_MIN_WIN_PCT, BreakEvenWinRatePct(2.5)));
+  Emit(fh, "------------------------------------------------------------------");
   Emit(fh, StringFormat(" Max drawdown       : %.2f%%  (must stay under %.1f%%)",
                         m_max_dd_pct, BT_MAX_DD_PCT));
+  Emit(fh, StringFormat(" Worst DAILY drawdown : %.2f%%  (must stay under %.1f%%)",
+                        m_worst_daily_dd_pct, BT_MAX_DAILY_DD_PCT));
+  Emit(fh, StringFormat(" Overall DD headroom  : %.2f%% used of %.1f%% allowed",
+                        m_max_dd_pct, BT_MAX_OVERALL_DD_PCT));
   Emit(fh, StringFormat(" Lowest equity      : $%.2f  at %s",
                         m_min_equity, TimeToString(m_min_equity_time)));
   Emit(fh, StringFormat(" Worst daily loss   : $%.2f  on %s",
