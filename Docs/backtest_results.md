@@ -1,6 +1,19 @@
 # Backtest Results — FP50K-EA
 
-**Status: ACCEPTANCE: FAIL — for both entry models tested to date.**
+**Status: ACCEPTANCE: FAIL. The sweep hypothesis was tested out-of-sample on
+2026-07-31 and invalidated — but on drawdown, not on edge.**
+
+Latest position in one line: the fade makes money out-of-sample (EV +$7.14 on
+2024 EURUSD, +$45.61 on 2025 GBPUSD) and takes an 11–15% drawdown against an 8%
+bar. Drawdown is now the binding constraint, and it has failed in every
+configuration this project has tested.
+
+**Attribution correction (2026-07-31):** every run below dated 2026-07-30 or
+2026-07-31 and labelled "EURUSD" was actually EURUSD + GBPUSD — both symbols
+were enabled in the EA while the tester chart was EURUSD. Comparisons between
+those runs remain valid; the instrument labels do not. Single-symbol runs are
+marked explicitly.
+
 
 Two hypotheses have now been measured to destruction on this data.
 
@@ -303,6 +316,68 @@ when it auto-detects 0h inside the tester.
 
 **This means the numbers above describe the right strategy measured over the
 wrong hours.** They are superseded by the corrected run below.
+
+### 2026-07-31 — out-of-sample walk-forward: hypothesis INVALIDATED
+
+Test of the 23:00–06:00 UTC window against data it was **not** selected on.
+Bar fixed before the run: **both** passes must clear win rate ≥ 28.6%, EV > $0
+and max drawdown < 8%. One clearing and the other failing is a fail — that is
+what out-of-sample means.
+
+| Run | Instrument | Period | Trades | Win % | PF | EV/trade | Max DD |
+|---|---|---|---|---|---|---|---|
+| Original baseline *(2-symbol)* | EUR+GBP | 2025 | 226 | 27.4% | 1.01 | +$2.98 | 28.34% |
+| Baseline re-measured *(1 symbol)* | EURUSD | 2025 | 87 | 24.1% | 0.86 | −$37.31 | 17.62% |
+| Pass 1 — historical OOS | EURUSD | 2024 | 85 | 28.2% | 1.03 | +$7.14 | 11.40% |
+| Pass 2 — cross-asset OOS | GBPUSD | 2025 | 138 | 30.4% | 1.17 | +$45.61 | 14.61% |
+
+| Condition | Pass 1 | Pass 2 |
+|---|---|---|
+| Win rate ≥ 28.6% | 28.2% — **fail** | 30.4% — pass |
+| EV > $0.00 | +$7.14 — pass | +$45.61 — pass |
+| Max DD < 8.0% | 11.40% — **fail** | 14.61% — **fail** |
+
+**Neither pass clears all three. Drawdown fails in both, at 1.4x and 1.8x the
+limit. INVALIDATED.**
+
+#### The correction that matters more than the verdict
+
+Before either OOS pass ran, re-measuring the baseline broke the hypothesis.
+
+**The PF 1.01 / +$2.98 result was never an EURUSD result.** `InpTradeEURUSD`
+and `InpTradeGBPUSD` were both enabled while the tester chart happened to be
+EURUSD, so every run was a two-symbol portfolio. Isolate EURUSD and 2025 gives
+PF 0.86 and −$37.31 per trade. The entire positive signal was GBPUSD trades
+inside a run labelled EURUSD.
+
+That reframes the rest of the table. Pass 2 is not out-of-sample confirmation —
+it is *where the in-sample result came from*, now correctly attributed. The only
+genuine out-of-sample test here is Pass 1, at PF 1.03 with a sub-break-even hit
+rate.
+
+**Every run in this document dated 2026-07-30 or 2026-07-31 and labelled
+"EURUSD" was in fact EURUSD + GBPUSD.** The relative comparisons between them
+still hold, since all carried the same configuration, but the instrument
+attribution was wrong. Single-symbol runs are labelled as such from here on.
+
+#### What survives, and what does not
+
+The direction of travel is real. EV is positive on 2024 EURUSD and clearly
+positive on 2025 GBPUSD. This is not a dead strategy the way the breakout was.
+
+It is not a tradeable one. Drawdown of 11–15% sits against an 8% acceptance bar
+and a 9% challenge floor, and drawdown is now the number that has failed in
+**every configuration tested** — both entry models, every window, every
+instrument. A strategy that makes money and takes a 15% trough still fails the
+challenge in its first bad month.
+
+The open question is therefore no longer "is there an edge" but "can the
+drawdown be cut by more than half on a strategy whose EV is marginally
+positive" — position sizing, correlation between the two symbols, and exposure
+control. That is a different problem from the one this project has been
+solving, and it should be picked up deliberately rather than drifted into.
+
+**Decision unchanged: no challenge purchase.**
 
 ### 2026-07-31 — session-window sweep (corrected clock)
 
