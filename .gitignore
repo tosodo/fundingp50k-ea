@@ -5,3 +5,7 @@ MQL5/**/*.log
 # Mac system files
 .DS_Store
 **/.DS_Store
+
+# Downloaded market data — reproducible via Research/cross_asset_screen/step0_fetch.py
+Research/cross_asset_screen/step0_data/
+Research/**/__pycache__/

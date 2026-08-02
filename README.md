@@ -10,6 +10,26 @@ Proprietary algorithmic trading system for the FundingPips $50,000 2-Step Flex c
 
 All code in this repository is original work authored and owned by the account holder. This repository serves as timestamped proof of authorship for FundingPips EA verification purposes.
 
+---
+
+> ## ⛔ Status: research programme closed (2026-08-02)
+>
+> **No profitable edge was found.** Five structurally different entry mechanisms
+> measured at approximately **zero** expectancy with trading costs removed
+> entirely, over 8.5 years and three currency pairs. A follow-up screen across
+> 19 instruments and six asset classes found no trend persistence at horizons up
+> to three months.
+>
+> **Read [`Docs/postmortem.md`](Docs/postmortem.md) before anything else in this
+> repository.** It documents both why the market did not contain what was being
+> looked for, and the defect in the research process itself.
+>
+> The strategy description below is retained as a record of what was tested. It
+> is **not** a recommendation, and no expert advisor here has ever been attached
+> to a chart.
+
+---
+
 ## Architecture
 
 | File | Role | Sprint |
@@ -25,6 +45,9 @@ All code in this repository is original work authored and owned by the account h
 | `MQL5/Scripts/fp50k/SignalEngine_tests.mq5` | Unit tests for Signal Engine | 2 |
 | `MQL5/Scripts/fp50k/NewsFilter_tests.mq5` | Unit tests for News Filter | 3 |
 | `MQL5/Scripts/fp50k/BacktestValidator_tests.mq5` | Unit tests for the validator | 4 |
+| `Docs/postmortem.md` | **Why the experiment did not succeed — read first** | — |
+| `Docs/strategy_lab.md` | Isolation bench: five hypotheses, all rejected | — |
+| `Research/cross_asset_screen/` | Trend-persistence screen, 19 instruments | — |
 | `Docs/backtest_results.md` | Backtest acceptance criteria + run log | 4 |
 | `sync_to_mt5.sh` | Copies source into the Wine MT5 install | 1 |
 | `run_tests.sh` | Headless compile + test runner | 2 |
