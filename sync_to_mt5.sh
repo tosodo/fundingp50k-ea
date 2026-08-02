@@ -12,10 +12,18 @@ fi
 
 cd "$(dirname "$0")" || exit 1
 
-for sub in Include Experts Scripts; do
-  echo "Syncing $sub/fp50k..."
-  mkdir -p "$MT5_MQL5/$sub/fp50k"
-  rsync -a --delete "MQL5/$sub/fp50k/" "$MT5_MQL5/$sub/fp50k/"
+for proj in fp50k lab; do
+  for sub in Include Experts Scripts; do
+    [ -d "MQL5/$sub/$proj" ] || continue
+    echo "Syncing $sub/$proj..."
+    mkdir -p "$MT5_MQL5/$sub/$proj"
+    # --delete removes anything in the destination that is not in the repo.
+    # Compiled binaries only ever exist in the destination, so without this
+    # exclude a sync run AFTER a compile silently wipes the .ex5 and the next
+    # backtest dies with "compiled EA not found". Keeping them is safe because
+    # run_lab.sh refuses to run a .ex5 older than its own source.
+    rsync -a --delete --exclude '*.ex5' "MQL5/$sub/$proj/" "$MT5_MQL5/$sub/$proj/"
+  done
 done
 
-echo "Sync complete. In MetaEditor: close the fp50k tabs, reopen them, then press F7."
+echo "Sync complete. In MetaEditor: close the project tabs, reopen them, then press F7."
